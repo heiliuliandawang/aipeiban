@@ -8,3 +8,7 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+backend/.chroma_db/ 
+backend/.test_chroma/ 
+"*.sqlite3" 
+"*.bin" 
