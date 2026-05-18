@@ -1,0 +1,20 @@
+{
+  "course_id": "intro_ai",
+  "title": "人工智能导论",
+  "description": "面向计算机、电子信息专业大学生的人工智能入门课程，涵盖经典AI方法与现代深度学习技术",
+  "chapters": [
+    {"id": "ch01", "file": "ch01_overview.md",    "title": "AI概述与发展历史",         "keywords": ["人工智能", "图灵测试", "专家系统", "深度学习", "发展历程"]},
+    {"id": "ch02", "file": "ch02_search.md",      "title": "搜索算法与问题求解",         "keywords": ["BFS", "DFS", "A*算法", "启发式搜索", "状态空间"]},
+    {"id": "ch03", "file": "ch03_ml_basics.md",   "title": "机器学习基础",               "keywords": ["监督学习", "无监督学习", "过拟合", "交叉验证", "特征工程"]},
+    {"id": "ch04", "file": "ch04_supervised.md",  "title": "监督学习：回归与分类",       "keywords": ["线性回归", "逻辑回归", "SVM", "决策树", "随机森林"]},
+    {"id": "ch05", "file": "ch05_neural_nets.md", "title": "神经网络与深度学习入门",     "keywords": ["感知机", "反向传播", "激活函数", "梯度下降", "深度学习"]},
+    {"id": "ch06", "file": "ch06_cnn.md",         "title": "卷积神经网络（CNN）",        "keywords": ["卷积", "池化", "特征图", "ResNet", "图像分类"]},
+    {"id": "ch07", "file": "ch07_nlp.md",         "title": "自然语言处理基础",           "keywords": ["词向量", "Word2Vec", "RNN", "LSTM", "文本分类"]},
+    {"id": "ch08", "file": "ch08_llm.md",         "title": "大语言模型与Transformer",   "keywords": ["Transformer", "自注意力", "BERT", "GPT", "预训练微调"]},
+    {"id": "ch09", "file": "ch09_rl.md",          "title": "强化学习基础",               "keywords": ["马尔可夫决策过程", "Q-learning", "策略梯度", "奖励函数"]},
+    {"id": "ch10", "file": "ch10_ethics.md",      "title": "AI伦理与未来展望",           "keywords": ["AI偏见", "可解释性", "隐私安全", "AGI", "负责任AI"]}
+  ],
+  "target_audience": "计算机/电子信息专业本科生",
+  "prerequisites": ["Python基础", "线性代数", "概率论"],
+  "total_hours": 48
+}
