@@ -1,44 +1,103 @@
 """
 学生画像构建 Agent
 职责：通过对话自动抽取学生信息，构建六维画像
-六维：知识基础、认知风格、学习目标、易错点、学习节奏、可用时间
+六维：专业方向、知识基础、认知风格、学习目标、学习节奏、薄弱知识点
 """
 import json
 import re
 from app.services import llm_service, session_store
 from app.models.schemas import StudentProfile
 
-SYSTEM_PROMPT = """你是一位友善的学习顾问助手，负责通过自然对话了解学生的学习情况，构建个性化学习画像。
+SYSTEM_PROMPT = """你是一位友善、专业的学习画像构建 Agent，负责通过自然对话收集学生的六维学习画像，并在每轮对话后输出结构化 JSON。
 
-你需要在对话中自然地收集以下信息（不要一次性问所有问题，循序渐进）：
-1. 姓名（可选）和所学专业
-2. 知识基础：对当前课程的掌握程度（入门/初级/中级/高级）
-3. 认知风格：偏好哪种学习方式（视觉图形型/逻辑推理型/动手实操型）
-4. 学习目标：学习这门课的目的（考研备考/竞赛提升/求职就业/个人兴趣）
-5. 薄弱知识点：觉得哪些内容最难理解或容易出错
-6. 学习节奏：喜欢快速浏览还是深度钻研
-7. 每日可用时间：每天大概能花多少时间学习
+【必须收集的六维画像】
+1. 专业方向 major：学生专业、学习方向或当前关注领域。
+2. 知识基础 knowledge_level：只能是「入门」「初级」「中级」「高级」之一。
+3. 认知风格 cognitive_style：只能是「视觉型」「逻辑型」「实操型」之一。
+4. 学习目标 learning_goal：只能是「考研」「竞赛」「就业」「兴趣」之一。
+5. 学习节奏 learning_pace：只能是「快速」「深度」之一。
+6. 薄弱知识点 weak_points：学生明确觉得难、容易错或需要补强的知识点列表。
 
-只要你已经从当前轮或历史对话中确认了任意画像信息，就在回复末尾附加如下 JSON 标记（用 ```json_profile``` 包裹），用于系统解析：
-```json_profile
+【对话策略】
+- 不要一次性问完所有维度，每轮优先追问 1-2 个缺失或不明确的维度。
+- 如果用户一句话里包含多个维度，要全部抽取并更新。
+- 对不确定的信息不要臆测，未知字段用 null 或空数组。
+- 每次回复都要先回应用户当前表达，再自然引导下一个关键信息。
+- 如果画像已基本完整，content 中给出简短确认，并说明后续资源会按画像个性化。
+
+【统一输出格式】
+你必须只输出一个合法 JSON 对象，不要输出 Markdown 代码块，不要在 JSON 前后添加任何文字。
+JSON 结构固定为：
 {
-  "major": "...",
-  "knowledge_level": "入门|初级|中级|高级",
-  "cognitive_style": "视觉型|逻辑型|实操型",
-  "learning_goal": "考研|竞赛|就业|兴趣",
-  "weak_points": ["知识点1", "知识点2"],
-  "learning_pace": "快速|深度",
-  "available_time": "每天X小时",
-  "completed": true
+  "content": "给学生看的中文自然语言回复",
+  "metadata": {
+    "agent": "profile_agent",
+    "profile_update": {
+      "major": "专业方向或 null",
+      "knowledge_level": "入门|初级|中级|高级|null",
+      "cognitive_style": "视觉型|逻辑型|实操型|null",
+      "learning_goal": "考研|竞赛|就业|兴趣|null",
+      "learning_pace": "快速|深度|null",
+      "weak_points": ["薄弱知识点"],
+      "available_time": "每天可用时间或 null",
+      "completed": false
+    },
+    "next_focus": ["下一轮建议追问的维度"]
+  }
 }
-```
 
-未确认的字段可以省略或填 null；如果信息还不完整，请将 completed 设为 false，并继续自然对话引导。
-回复使用中文，语气亲切自然。"""
+【few-shot 示例 1】
+用户：我是计算机专业大二学生，刚开始学人工智能，想为就业做准备。
+助手：
+{
+  "content": "了解啦，你是计算机专业大二学生，AI 基础还处在入门阶段，目标偏就业。我接下来会按更实用的路线帮你规划。为了更贴合你，我还想了解一下：你更喜欢看图表理解概念、按逻辑推导理解，还是通过代码实操来掌握？",
+  "metadata": {
+    "agent": "profile_agent",
+    "profile_update": {
+      "major": "计算机",
+      "knowledge_level": "入门",
+      "cognitive_style": null,
+      "learning_goal": "就业",
+      "learning_pace": null,
+      "weak_points": [],
+      "available_time": null,
+      "completed": false
+    },
+    "next_focus": ["认知风格", "学习节奏", "薄弱知识点"]
+  }
+}
+
+【few-shot 示例 2】
+用户：我喜欢先看图和表格，节奏希望快一点，最近反向传播和矩阵求导总是搞混，每天大概 1.5 小时。
+助手：
+{
+  "content": "好的，你更偏视觉型学习，适合用流程图、表格和对比图来理解；学习节奏希望快一些。反向传播和矩阵求导会作为重点薄弱点处理。我已经能形成较完整画像，后续会优先用图解和针对性练习帮你补这两块。",
+  "metadata": {
+    "agent": "profile_agent",
+    "profile_update": {
+      "major": null,
+      "knowledge_level": null,
+      "cognitive_style": "视觉型",
+      "learning_goal": null,
+      "learning_pace": "快速",
+      "weak_points": ["反向传播", "矩阵求导"],
+      "available_time": "每天1.5小时",
+      "completed": true
+    },
+    "next_focus": []
+  }
+}"""
 
 
-def _extract_profile_json(text: str) -> dict | None:
-    """从 LLM 回复中提取画像 JSON"""
+def _extract_agent_json(text: str) -> dict | None:
+    """从 LLM 回复中提取统一 JSON；兼容旧版 json_profile 标记块。"""
+    cleaned = text.strip()
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        pass
+
     start = text.find("```json_profile")
     end = text.find("```", start + 15)
     if start == -1 or end == -1:
@@ -50,15 +109,30 @@ def _extract_profile_json(text: str) -> dict | None:
         return None
 
 
+def _extract_profile_json(text: str) -> dict | None:
+    """从统一 JSON 的 metadata.profile_update 中提取画像更新。"""
+    data = _extract_agent_json(text)
+    if not data:
+        return None
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("profile_update"), dict):
+        return metadata["profile_update"]
+    return data
+
+
 def _clean_response(text: str) -> str:
-    """去掉给用户展示的文本中的 JSON 标记块"""
+    """返回给用户展示的 content；兼容旧版 JSON 标记块。"""
+    data = _extract_agent_json(text)
+    if isinstance(data, dict) and isinstance(data.get("content"), str):
+        return data["content"].strip()
+
     start = text.find("```json_profile")
     if start == -1:
         return text
     return text[:start].strip()
 
 
-def _apply_profile_data(profile: StudentProfile, profile_data: dict | None) -> StudentProfile:
+async def _apply_profile_data(profile: StudentProfile, profile_data: dict | None) -> StudentProfile:
     """将 LLM 返回的部分画像信息合并进现有 profile。"""
     if not profile_data:
         return profile
@@ -81,7 +155,7 @@ def _apply_profile_data(profile: StudentProfile, profile_data: dict | None) -> S
     if profile_data.get("completed") is True:
         profile.completed_at = True
 
-    session_store.update_profile(profile)
+    await session_store.update_profile(profile)
     return profile
 
 
@@ -151,18 +225,18 @@ def _infer_profile_from_user_message(text: str) -> dict | None:
     return result or None
 
 
-def infer_and_update_profile(session_id: str, user_message: str) -> StudentProfile:
+async def infer_and_update_profile(session_id: str, user_message: str) -> StudentProfile:
     """先用规则从用户消息中提取明显画像信息，便于前端实时展示。"""
-    profile = session_store.get_profile(session_id)
-    return _apply_profile_data(profile, _infer_profile_from_user_message(user_message))
+    profile = await session_store.get_profile(session_id)
+    return await _apply_profile_data(profile, _infer_profile_from_user_message(user_message))
 
 
 async def chat(session_id: str, user_message: str) -> tuple[str, StudentProfile]:
     """
     处理用户消息，返回 (回复文本, 最新画像)
     """
-    profile = infer_and_update_profile(session_id, user_message)
-    history = session_store.get_history(session_id)
+    profile = await infer_and_update_profile(session_id, user_message)
+    history = await session_store.get_history(session_id)
 
     # 构建消息列表
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -173,57 +247,38 @@ async def chat(session_id: str, user_message: str) -> tuple[str, StudentProfile]
     raw_response = await llm_service.chat_completion(messages)
 
     # 尝试解析画像更新
-    profile = _apply_profile_data(profile, _extract_profile_json(raw_response))
+    profile = await _apply_profile_data(profile, _extract_profile_json(raw_response))
 
     # 清理回复（移除 JSON 标记），存历史
     clean_reply = _clean_response(raw_response)
-    session_store.append_history(session_id, "user", user_message)
-    session_store.append_history(session_id, "assistant", clean_reply)
+    await session_store.append_history(session_id, "user", user_message)
+    await session_store.append_history(session_id, "assistant", clean_reply)
 
     return clean_reply, profile
 
 
 async def chat_stream(session_id: str, user_message: str):
     """
-    流式版本，yield 干净的文本片段（自动过滤 json_profile 标记块）
+    流式版本，yield 干净的 content（自动过滤统一 JSON 外壳）
     在内部完成 profile 提取和 session 更新，调用方无需做任何裁剪。
     """
-    profile = infer_and_update_profile(session_id, user_message)
-    history = session_store.get_history(session_id)
+    profile = await infer_and_update_profile(session_id, user_message)
+    history = await session_store.get_history(session_id)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
-    MARKER = "```json_profile"
     full_response = ""
-    yielded_up_to = 0        # 已 yield 到 full_response 的第几个字符
 
     async for chunk in llm_service.chat_stream(messages):
         full_response += chunk
-        marker_pos = full_response.find(MARKER)
-
-        if marker_pos == -1:
-            # 标记尚未出现：留出 MARKER长度-1 的尾缓冲，防止标记跨 chunk 被截断
-            safe_end = max(yielded_up_to, len(full_response) - (len(MARKER) - 1))
-            if safe_end > yielded_up_to:
-                yield full_response[yielded_up_to:safe_end]
-                yielded_up_to = safe_end
-        else:
-            # 标记已出现：yield 标记前的内容（若还有未 yield 的部分）
-            if marker_pos > yielded_up_to:
-                yield full_response[yielded_up_to:marker_pos]
-                yielded_up_to = marker_pos
-            # 剩余内容含 JSON，继续消费但不 yield
-
-    # 流结束：yield 剩余缓冲（仅当全程无 marker 时）
-    marker_pos = full_response.find(MARKER)
-    if marker_pos == -1 and yielded_up_to < len(full_response):
-        yield full_response[yielded_up_to:]
 
     # 提取并更新画像（始终在流结束后执行，无论是否 break）
-    profile = _apply_profile_data(profile, _extract_profile_json(full_response))
+    profile = await _apply_profile_data(profile, _extract_profile_json(full_response))
 
     clean_reply = _clean_response(full_response)
-    session_store.append_history(session_id, "user", user_message)
-    session_store.append_history(session_id, "assistant", clean_reply)
+    if clean_reply:
+        yield clean_reply
+    await session_store.append_history(session_id, "user", user_message)
+    await session_store.append_history(session_id, "assistant", clean_reply)

@@ -1,17 +1,31 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { clearChatSession, createSession, syncSessionState } from "@/lib/api";
+import {
+  clearChatSession,
+  createSession,
+  getSessionState,
+  listSessions as listBackendSessions,
+  syncSessionState,
+} from "@/lib/api";
 import ProfileSidebar from "@/components/ProfileSidebar";
 import ChatPanel, { createWelcomeMessage } from "@/components/ChatPanel";
 import ResourcePanel from "@/components/ResourcePanel";
 import TutorPanel from "@/components/TutorPanel";
 import KnowledgePanel from "@/components/KnowledgePanel";
-import type { ChatMessage, PlannerSession, ResourceWorkspace, StudentProfile } from "@/types";
+import type {
+  ApiChatMessage,
+  ChatMessage,
+  PlannerSession,
+  ResourceWorkspace,
+  StudentProfile,
+} from "@/types";
+import { createEmptyProfile } from "@/types";
 
 type ActiveTab = "chat" | "resources" | "path" | "tutor" | "knowledge";
 
 const STORAGE_KEY = "edumind-planner-sessions-v1";
+const SESSION_ID_KEY = "edumind-session-id";
 
 const TABS: { id: ActiveTab; label: string; icon: string; desc: string }[] = [
   { id: "chat", label: "学习对话", icon: "💬", desc: "构建个性化画像" },
@@ -21,14 +35,6 @@ const TABS: { id: ActiveTab; label: string; icon: string; desc: string }[] = [
   { id: "knowledge", label: "学习检索", icon: "📚", desc: "本地章节与联网搜索" },
 ];
 const DEFAULT_RESOURCE_TYPES = ["document", "quiz", "mindmap", "code_example", "reading"] as const;
-
-function createEmptyProfile(sessionId: string): StudentProfile {
-  return {
-    session_id: sessionId,
-    weak_points: [],
-    completed_at: false,
-  };
-}
 
 function trimTitle(text: string, max = 18) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
@@ -64,6 +70,28 @@ function createPlannerSessionSnapshot(sessionId: string, fallbackIndex: number):
     messages: [createWelcomeMessage()],
     learningPath: "",
     resourceWorkspace: createEmptyResourceWorkspace(),
+  };
+}
+
+function createPlannerSessionFromBackend(
+  state: Awaited<ReturnType<typeof getSessionState>>,
+  fallbackIndex: number
+): PlannerSession {
+  const now = new Date().toISOString();
+  const messages = state.messages.length
+    ? state.messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+        timestamp: new Date(message.timestamp),
+      }))
+    : [createWelcomeMessage()];
+
+  return {
+    ...createPlannerSessionSnapshot(state.session_id, fallbackIndex),
+    createdAt: now,
+    updatedAt: now,
+    profile: { ...createEmptyProfile(state.session_id), ...state.profile, session_id: state.session_id },
+    messages,
   };
 }
 
@@ -133,7 +161,7 @@ function restoreSessions(raw: unknown): PlannerSession[] {
   );
 }
 
-function buildBackendHistory(messages: ChatMessage[]) {
+function buildBackendHistory(messages: ChatMessage[]): ApiChatMessage[] {
   return messages
     .slice(1)
     .filter((message) => message.content.trim())
@@ -328,6 +356,7 @@ export default function Home() {
 
     const bootstrap = async () => {
       try {
+        const storedSessionId = localStorage.getItem(SESSION_ID_KEY);
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw) as {
@@ -337,17 +366,66 @@ export default function Home() {
           };
           const restoredSessions = restoreSessions(parsed.sessions);
           if (restoredSessions.length > 0) {
+            const preferredSessionId =
+              storedSessionId && restoredSessions.some((session) => session.id === storedSessionId)
+                ? storedSessionId
+                : parsed.activeSessionId;
             if (cancelled) return;
             setSessions(restoredSessions);
             setActiveSessionId(
-              restoredSessions.some((session) => session.id === parsed.activeSessionId)
-                ? parsed.activeSessionId || restoredSessions[0].id
+              restoredSessions.some((session) => session.id === preferredSessionId)
+                ? preferredSessionId || restoredSessions[0].id
                 : restoredSessions[0].id
             );
             setActiveTab(parsed.activeTab || "chat");
             setConnected(true);
             return;
           }
+        }
+
+        const backendSessions = await listBackendSessions().catch(() => ({ sessions: [] }));
+        if (backendSessions.sessions.length > 0) {
+          const activeBackendSession =
+            backendSessions.sessions.find((session) => session.session_id === storedSessionId) ||
+            backendSessions.sessions[0];
+          const activeState = await getSessionState(activeBackendSession.session_id);
+          if (cancelled) return;
+
+          const restoredFromBackend = normalizeSessions(
+            backendSessions.sessions.map((session, index) => {
+              const base = createPlannerSessionSnapshot(session.session_id, index + 1);
+              const isActive = session.session_id === activeState.session_id;
+              return {
+                ...base,
+                createdAt: session.created_at,
+                updatedAt: session.last_access,
+                profile: {
+                  ...createEmptyProfile(session.session_id),
+                  ...session.profile,
+                  session_id: session.session_id,
+                },
+                messages: isActive
+                  ? createPlannerSessionFromBackend(activeState, index + 1).messages
+                  : base.messages,
+              };
+            })
+          );
+
+          setSessions(restoredFromBackend);
+          setActiveSessionId(activeState.session_id);
+          setActiveTab("chat");
+          setConnected(true);
+          return;
+        }
+
+        if (storedSessionId) {
+          const state = await getSessionState(storedSessionId);
+          if (cancelled) return;
+          const restoredSession = createPlannerSessionFromBackend(state, 1);
+          setSessions([restoredSession]);
+          setActiveSessionId(state.session_id);
+          setConnected(true);
+          return;
         }
 
         const sessionId = await createSession();
@@ -371,6 +449,11 @@ export default function Home() {
 
   useEffect(() => {
     if (isBootstrapping) return;
+    if (activeSessionId) {
+      localStorage.setItem(SESSION_ID_KEY, activeSessionId);
+    } else {
+      localStorage.removeItem(SESSION_ID_KEY);
+    }
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({

@@ -51,5 +51,5 @@ async def get_suggested_questions(topic: str = ""):
 @router.delete("/history/{session_id}")
 async def clear_history(session_id: str):
     """清除辅导对话历史"""
-    session_store.clear_tutor_history(session_id)
+    await session_store.clear_tutor_history(session_id)
     return {"message": "tutor history cleared"}

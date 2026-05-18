@@ -82,12 +82,12 @@ export default function ResourcePanel({ sessionId, profile, workspace, onWorkspa
           ...prev,
           taskStatuses: {
             ...prev.taskStatuses,
-            [type as ResourceType]: taskStatus === "generating" ? "generating" : "done",
+            [type]: taskStatus === "generating" ? "generating" : "done",
           },
         }));
       },
       (type, label, content) => {
-        const resource: GeneratedResource = { type: type as ResourceType, label, content };
+        const resource: GeneratedResource = { type, label, content };
         onWorkspaceChange((prev) => {
           const updatedResources = [...prev.resources.filter((item) => item.type !== resource.type), resource];
           return {

@@ -431,7 +431,7 @@ function WebSearchResultCard({ result }: { result: WebSearchResult }) {
         {result.url ? (
           <p className="text-[11px] text-slate-400 mt-1 truncate">{result.url}</p>
         ) : (
-          <p className="text-[11px] text-amber-600 mt-1">星火推荐阅读 · 请自行在平台检索</p>
+          <p className="text-[11px] text-amber-600 mt-1">星火推荐阅读 · 请自行在平台检索</ p>
         )}
       </div>
       {result.snippet && (

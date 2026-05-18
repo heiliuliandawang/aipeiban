@@ -1,43 +1,94 @@
+import type {
+  ChatDeltaEvent,
+  ChatServerErrorEvent,
+  ClearSessionResponse,
+  CoursesListResponse,
+  ChaptersListResponse,
+  CreateSessionResponse,
+  InitKnowledgeResponse,
+  KnowledgeChapterDetail,
+  KnowledgeSearchResponse,
+  ListSessionsResponse,
+  SessionSyncRequest,
+  SessionStateResponse,
+  SessionSyncResponse,
+  StreamCancelFn,
+  StudentProfile,
+  SuggestedQuestionsResponse,
+  TutorAskRequest,
+  TutorDeltaEvent,
+  WebSearchResponse,
+} from "@/types";
+import type {
+  GenerateResourcesRequest,
+  LearningPathRequest,
+  LearningPathResponse,
+  ResourceContentEvent,
+  ResourceProgressEvent,
+  ResourceServerErrorEvent,
+  ResourceStreamEventName,
+  ResourceType,
+} from "@/types/resource";
+import { parseSseJson } from "@/types/chat";
+
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+async function parseJsonResponse<T>(res: Response): Promise<T> {
+  return res.json() as Promise<T>;
+}
 
 export async function createSession(): Promise<string> {
   const res = await fetch(`${BASE_URL}/chat/session`, { method: "POST" });
-  const data = await res.json();
+  const data = await parseJsonResponse<CreateSessionResponse>(res);
   return data.session_id;
 }
 
-export async function getProfile(sessionId: string) {
-  const res = await fetch(`${BASE_URL}/chat/profile/${sessionId}`);
-  return res.json();
+export async function listSessions(): Promise<ListSessionsResponse> {
+  const res = await fetch(`${BASE_URL}/chat/sessions`);
+  return parseJsonResponse<ListSessionsResponse>(res);
 }
 
-export async function syncSessionState(params: {
-  session_id: string;
-  profile: object;
-  history: Array<{ role: "user" | "assistant"; content: string }>;
-}) {
+export async function getSessionState(
+  sessionId: string
+): Promise<SessionStateResponse> {
+  const res = await fetch(`${BASE_URL}/chat/session/${sessionId}`);
+  return parseJsonResponse<SessionStateResponse>(res);
+}
+
+export async function getProfile(sessionId: string): Promise<StudentProfile> {
+  const res = await fetch(`${BASE_URL}/chat/profile/${sessionId}`);
+  return parseJsonResponse<StudentProfile>(res);
+}
+
+export async function syncSessionState(
+  params: SessionSyncRequest
+): Promise<SessionSyncResponse> {
   const res = await fetch(`${BASE_URL}/chat/session/sync`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(params),
   });
-  return res.json();
+  return parseJsonResponse<SessionSyncResponse>(res);
 }
 
-export async function clearChatSession(sessionId: string) {
-  const res = await fetch(`${BASE_URL}/chat/session/${sessionId}`, { method: "DELETE" });
-  return res.json();
+export async function clearChatSession(
+  sessionId: string
+): Promise<ClearSessionResponse> {
+  const res = await fetch(`${BASE_URL}/chat/session/${sessionId}`, {
+    method: "DELETE",
+  });
+  return parseJsonResponse<ClearSessionResponse>(res);
 }
 
-/** 流式对话，通过 SSE 逐字返回 */
+/** 流式对话，通过 EventSource SSE 逐字返回 */
 export function streamChat(
   sessionId: string,
   message: string,
   onDelta: (text: string) => void,
-  onProfileUpdate: (profile: object) => void,
+  onProfileUpdate: (profile: StudentProfile) => void,
   onDone: () => void,
   onError: (message: string) => void
-): () => void {
+): StreamCancelFn {
   const url = new URL(`${BASE_URL}/chat/message/stream`);
   url.searchParams.set("session_id", sessionId);
   url.searchParams.set("message", message);
@@ -52,22 +103,22 @@ export function streamChat(
     onDone();
   };
 
-  es.addEventListener("delta", (e) => {
-    const data = JSON.parse(e.data);
+  es.addEventListener("delta", (e: Event) => {
+    const data = parseSseJson<ChatDeltaEvent>((e as MessageEvent<string>).data);
     onDelta(data.text);
   });
 
-  es.addEventListener("profile_update", (e) => {
-    onProfileUpdate(JSON.parse(e.data));
+  es.addEventListener("profile_update", (e: Event) => {
+    onProfileUpdate(parseSseJson<StudentProfile>((e as MessageEvent<string>).data));
   });
 
   es.addEventListener("done", () => {
     finish();
   });
 
-  es.addEventListener("server_error", (e) => {
+  es.addEventListener("server_error", (e: Event) => {
     try {
-      const data = JSON.parse(e.data);
+      const data = parseSseJson<ChatServerErrorEvent>((e as MessageEvent<string>).data);
       onError(data.message || "对话服务暂时不可用，请稍后重试。");
     } catch {
       onError("对话服务暂时不可用，请稍后重试。");
@@ -82,18 +133,54 @@ export function streamChat(
   return () => finish();
 }
 
-/** 流式资源生成；返回的函数为「暂停/取消」：会中断请求并触发 onAbort */
+function isResourceType(value: string): value is ResourceType {
+  return (
+    value === "document" ||
+    value === "quiz" ||
+    value === "mindmap" ||
+    value === "code_example" ||
+    value === "reading"
+  );
+}
+
+/** 解析 fetch ReadableStream 上的 SSE 行 */
+async function consumeFetchSse(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: ResourceStreamEventName | "delta" | "done", data: string) => void
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    let currentEvent = "";
+    for (const line of lines) {
+      if (line.startsWith("event: ")) {
+        currentEvent = line.slice(7).trim();
+      } else if (line.startsWith("data: ")) {
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        onEvent(currentEvent as ResourceStreamEventName | "delta" | "done", raw);
+      }
+    }
+  }
+}
+
+/** 流式资源生成；返回的函数为「暂停/取消」 */
 export function streamGenerateResources(
-  params: {
-    session_id: string;
-    topic: string;
-    resource_types: string[];
-  },
-  onProgress: (type: string, label: string, status: string) => void,
-  onResource: (type: string, label: string, content: string) => void,
+  params: GenerateResourcesRequest,
+  onProgress: (type: ResourceType, label: string, status: string) => void,
+  onResource: (type: ResourceType, label: string, content: string) => void,
   onDone: () => void,
   onAbort?: () => void
-): () => void {
+): StreamCancelFn {
   const ctrl = new AbortController();
   let settled = false;
   const settle = (mode: "done" | "abort") => {
@@ -113,7 +200,11 @@ export function streamGenerateResources(
       });
 
       if (!res.ok) {
-        console.error("[streamGenerateResources] HTTP", res.status, await res.text().catch(() => ""));
+        console.error(
+          "[streamGenerateResources] HTTP",
+          res.status,
+          await res.text().catch(() => "")
+        );
         settle("done");
         return;
       }
@@ -122,43 +213,31 @@ export function streamGenerateResources(
         return;
       }
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      outer: while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        let currentEvent = "";
-        for (const line of lines) {
-          if (line.startsWith("event: ")) {
-            currentEvent = line.slice(7).trim();
-          } else if (line.startsWith("data: ")) {
-            const raw = line.slice(6).trim();
-            if (!raw || raw === "") continue;
-            try {
-              const data = JSON.parse(raw);
-              if (currentEvent === "progress") {
-                onProgress(data.type, data.label, data.status);
-              } else if (currentEvent === "resource") {
-                onResource(data.type, data.label, data.content);
-              } else if (currentEvent === "server_error") {
-                console.error("[streamGenerateResources] server_error", data.message);
-              } else if (currentEvent === "done") {
-                settle("done");
-                break outer;
-              }
-            } catch {
-              // ignore parse errors
+      let shouldStop = false;
+      await consumeFetchSse(res.body, (currentEvent, raw) => {
+        if (shouldStop) return;
+        try {
+          if (currentEvent === "progress") {
+            const data = parseSseJson<ResourceProgressEvent>(raw);
+            if (isResourceType(data.type)) {
+              onProgress(data.type, data.label, data.status);
             }
+          } else if (currentEvent === "resource") {
+            const data = parseSseJson<ResourceContentEvent>(raw);
+            if (isResourceType(data.type)) {
+              onResource(data.type, data.label, data.content);
+            }
+          } else if (currentEvent === "server_error") {
+            const data = parseSseJson<ResourceServerErrorEvent>(raw);
+            console.error("[streamGenerateResources] server_error", data.message);
+          } else if (currentEvent === "done") {
+            shouldStop = true;
+            settle("done");
           }
+        } catch {
+          // ignore parse errors
         }
-      }
+      });
       settle("done");
     } catch (e) {
       if (ctrl.signal.aborted) settle("abort");
@@ -172,65 +251,66 @@ export function streamGenerateResources(
   return () => ctrl.abort();
 }
 
-export async function getLearningPath(sessionId: string, profile: object) {
+export async function getLearningPath(
+  sessionId: string,
+  profile: StudentProfile,
+  course = "人工智能导论"
+): Promise<LearningPathResponse> {
+  const body: LearningPathRequest = {
+    session_id: sessionId,
+    course,
+    profile,
+  };
   const res = await fetch(`${BASE_URL}/resources/learning-path`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, course: "人工智能导论", profile }),
+    body: JSON.stringify(body),
   });
-  return res.json();
+  return parseJsonResponse<LearningPathResponse>(res);
 }
 
-/** 流式辅导问答，SSE 推送逐字回复 */
+/** 流式辅导问答，fetch + SSE 逐字回复 */
 export function streamTutorAsk(
-  params: { session_id: string; question: string; current_topic: string },
+  params: TutorAskRequest,
   onDelta: (text: string) => void,
   onDone: () => void
-): () => void {
+): StreamCancelFn {
   const ctrl = new AbortController();
 
   (async () => {
-    const res = await fetch(`${BASE_URL}/tutor/ask/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-      signal: ctrl.signal,
-    });
+    try {
+      const res = await fetch(`${BASE_URL}/tutor/ask/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+        signal: ctrl.signal,
+      });
 
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      let currentEvent = "";
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          currentEvent = line.slice(7).trim();
-        } else if (line.startsWith("data: ")) {
-          const raw = line.slice(6).trim();
-          if (!raw) continue;
-          try {
-            if (currentEvent === "delta") {
-              const data = JSON.parse(raw);
-              onDelta(data.text);
-            } else if (currentEvent === "done") {
-              onDone();
-            }
-          } catch {
-            // ignore parse errors
-          }
-        }
+      if (!res.ok || !res.body) {
+        onDone();
+        return;
       }
+
+      let shouldStop = false;
+      await consumeFetchSse(res.body, (currentEvent, raw) => {
+        if (shouldStop) return;
+        try {
+          if (currentEvent === "delta") {
+            const data = parseSseJson<TutorDeltaEvent>(raw);
+            onDelta(data.text);
+          } else if (currentEvent === "done") {
+            shouldStop = true;
+            onDone();
+          }
+        } catch {
+          // ignore parse errors
+        }
+      });
+      onDone();
+    } catch {
+      onDone();
     }
-    onDone();
-  })().catch(() => onDone());
+  })();
 
   return () => ctrl.abort();
 }
@@ -240,59 +320,63 @@ export async function getSuggestedQuestions(topic: string): Promise<string[]> {
   const res = await fetch(
     `${BASE_URL}/tutor/suggested-questions?topic=${encodeURIComponent(topic)}`
   );
-  const data = await res.json();
+  const data = await parseJsonResponse<SuggestedQuestionsResponse>(res);
   return data.questions || [];
 }
 
 // ── 知识库 API ──────────────────────────────────────────
 
-/** 触发知识库向量化初始化 */
-export async function initKnowledge() {
+export async function initKnowledge(): Promise<InitKnowledgeResponse> {
   const res = await fetch(`${BASE_URL}/knowledge/init`);
-  return res.json();
+  return parseJsonResponse<InitKnowledgeResponse>(res);
 }
 
-/** 列出所有课程 */
-export async function listCourses() {
+export async function listCourses(): Promise<CoursesListResponse> {
   const res = await fetch(`${BASE_URL}/knowledge/courses`);
-  return res.json();
+  return parseJsonResponse<CoursesListResponse>(res);
 }
 
-/** 列出某课程的所有章节 */
-export async function listChapters(courseName: string) {
+export async function listChapters(courseName: string): Promise<ChaptersListResponse> {
   const res = await fetch(
     `${BASE_URL}/knowledge/courses/${encodeURIComponent(courseName)}/chapters`
   );
-  return res.json();
+  return parseJsonResponse<ChaptersListResponse>(res);
 }
 
-/** 获取章节完整内容 */
-export async function getChapter(courseName: string, chapterId: string) {
+export async function getChapter(
+  courseName: string,
+  chapterId: string
+): Promise<KnowledgeChapterDetail> {
   const res = await fetch(
     `${BASE_URL}/knowledge/courses/${encodeURIComponent(courseName)}/chapters/${chapterId}`
   );
-  return res.json();
+  return parseJsonResponse<KnowledgeChapterDetail>(res);
 }
 
-/** 语义搜索知识库（仅本地 backend/knowledge_base 下的章节） */
-export async function searchKnowledge(query: string, course?: string, topK = 3) {
+export async function searchKnowledge(
+  query: string,
+  course?: string,
+  topK = 3
+): Promise<KnowledgeSearchResponse> {
   const params = new URLSearchParams({ q: query, top_k: String(topK) });
   if (course) params.set("course", course);
   const res = await fetch(`${BASE_URL}/knowledge/search?${params}`);
-  return res.json();
+  return parseJsonResponse<KnowledgeSearchResponse>(res);
 }
 
-/** 联网检索学习资料（DuckDuckGo） */
-export async function searchKnowledgeWeb(query: string, topK = 8) {
+export async function searchKnowledgeWeb(
+  query: string,
+  topK = 8
+): Promise<WebSearchResponse> {
   const params = new URLSearchParams({ q: query, top_k: String(topK) });
   const res = await fetch(`${BASE_URL}/knowledge/web-search?${params}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error((err as { detail?: string }).detail || "联网检索失败");
+    const detail =
+      typeof err === "object" && err !== null && "detail" in err
+        ? String((err as { detail: unknown }).detail)
+        : "联网检索失败";
+    throw new Error(detail);
   }
-  return res.json() as Promise<{
-    query: string;
-    results: Array<{ title: string; url: string; snippet: string }>;
-    count: number;
-  }>;
+  return parseJsonResponse<WebSearchResponse>(res);
 }

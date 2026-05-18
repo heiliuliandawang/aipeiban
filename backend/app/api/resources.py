@@ -32,7 +32,7 @@ async def generate_resources_stream(req: GenerateResourceRequest):
       - resource: { type, label, content }
       - done
     """
-    profile = req.profile or session_store.get_profile(req.session_id)
+    profile = req.profile or await session_store.get_profile(req.session_id)
 
     async def event_generator():
         # 先通知前端各 Agent 开始工作
@@ -70,6 +70,7 @@ async def generate_resources_stream(req: GenerateResourceRequest):
                         ensure_ascii=False,
                     ),
                 }
+                await session_store.save_resource(req.session_id, rt.value, content)
         except Exception as e:
             logger.exception("资源生成流异常（含客户端断开）: %s", e)
             yield {
@@ -85,12 +86,14 @@ async def generate_resources_stream(req: GenerateResourceRequest):
 @router.post("/generate")
 async def generate_resources_sync(req: GenerateResourceRequest):
     """同步版资源生成（调试用）"""
-    profile = req.profile or session_store.get_profile(req.session_id)
+    profile = req.profile or await session_store.get_profile(req.session_id)
     results = await resource_agent.generate_resources(
         topic=req.topic,
         resource_types=req.resource_types,
         profile=profile,
     )
+    for rt, content in results.items():
+        await session_store.save_resource(req.session_id, rt.value, content)
     return {
         rt.value: {"label": RESOURCE_LABELS[rt], "content": content}
         for rt, content in results.items()
@@ -100,14 +103,15 @@ async def generate_resources_sync(req: GenerateResourceRequest):
 @router.post("/learning-path")
 async def get_learning_path(req: LearningPathRequest):
     """生成个性化学习路径"""
-    path = await path_agent.plan_path(req.profile, req.course)
+    profile = req.profile or await session_store.get_profile(req.session_id)
+    path = await path_agent.plan_path(profile, req.course)
     return {"path": path}
 
 
 @router.get("/recommend/{session_id}")
 async def get_recommendations(session_id: str):
     """基于画像推荐学习资源"""
-    profile = session_store.get_profile(session_id)
+    profile = await session_store.get_profile(session_id)
     topics = [
         "AI概述与发展历史",
         "机器学习基础",
@@ -117,3 +121,9 @@ async def get_recommendations(session_id: str):
     ]
     recommendation = await path_agent.recommend_resources(profile, topics)
     return {"recommendation": recommendation}
+
+
+@router.get("/{session_id}/saved")
+async def list_saved_resources(session_id: str):
+    """列出某个 session 已持久化的生成资源。"""
+    return {"resources": await session_store.list_resources(session_id)}

@@ -1,63 +1,70 @@
-export interface StudentProfile {
-  session_id: string;
-  name?: string;
-  major?: string;
-  knowledge_level?: "入门" | "初级" | "中级" | "高级";
-  cognitive_style?: "视觉型" | "逻辑型" | "实操型";
-  learning_goal?: "考研" | "竞赛" | "就业" | "兴趣";
-  weak_points: string[];
-  learning_pace?: "快速" | "深度";
-  available_time?: string;
-  completed_at: boolean;
-}
+export type {
+  KnowledgeLevel,
+  CognitiveStyle,
+  LearningGoal,
+  LearningPace,
+  StudentProfile,
+  ProfileDimensionKey,
+} from "./profile";
+export {
+  PROFILE_DIMENSION_LABELS,
+  createEmptyProfile,
+  isProfileDimensionFilled,
+} from "./profile";
 
-export type ResourceType =
-  | "document"
-  | "quiz"
-  | "mindmap"
-  | "code_example"
-  | "reading";
+export type {
+  ResourceType,
+  GeneratedResource,
+  ResourceGenerationStatus,
+  ResourceTaskStatus,
+  ResourceStreamProgressStatus,
+  ResourceWorkspace,
+  GenerateResourcesRequest,
+  ResourceProgressEvent,
+  ResourceContentEvent,
+  ResourceServerErrorEvent,
+  ResourceStreamEventName,
+  LearningPathRequest,
+  LearningPathResponse,
+  RecommendationsResponse,
+} from "./resource";
+export { RESOURCE_LABELS, RESOURCE_ICONS } from "./resource";
 
-export const RESOURCE_LABELS: Record<ResourceType, string> = {
-  document: "课程讲解文档",
-  quiz: "练习题库",
-  mindmap: "思维导图",
-  code_example: "代码实操案例",
-  reading: "拓展阅读",
-};
+export type {
+  MessageRole,
+  ChatMessage,
+  ApiChatMessage,
+  CreateSessionResponse,
+  BackendSessionSummary,
+  ListSessionsResponse,
+  SessionStateResponse,
+  SessionSyncRequest,
+  SessionSyncResponse,
+  ClearSessionResponse,
+  SendMessageRequest,
+  SendMessageResponse,
+  ChatStreamEventName,
+  ChatDeltaEvent,
+  ChatServerErrorEvent,
+  TutorStreamEventName,
+  TutorDeltaEvent,
+  TutorAskRequest,
+  SuggestedQuestionsResponse,
+  StreamCancelFn,
+  ChatStreamCallbacks,
+  TutorStreamCallbacks,
+} from "./chat";
+export { parseSseJson } from "./chat";
 
-export const RESOURCE_ICONS: Record<ResourceType, string> = {
-  document: "📄",
-  quiz: "✏️",
-  mindmap: "🗺️",
-  code_example: "💻",
-  reading: "📚",
-};
-
-export interface GeneratedResource {
-  type: ResourceType;
-  label: string;
-  content: string;
-}
-
-export type ResourceGenerationStatus = "idle" | "generating" | "done";
-export type ResourceTaskStatus = "waiting" | "generating" | "done";
-
-export interface ResourceWorkspace {
-  topic: string;
-  selectedTypes: ResourceType[];
-  status: ResourceGenerationStatus;
-  taskStatuses: Partial<Record<ResourceType, ResourceTaskStatus>>;
-  resources: GeneratedResource[];
-  activeResourceType?: ResourceType;
-}
-
-export interface ChatMessage {
+/** 辅导面板消息 */
+export interface TutorMessage {
   role: "user" | "assistant";
   content: string;
   timestamp: Date;
+  topic?: string;
 }
 
+/** 本地持久化的学习计划会话 */
 export interface PlannerSession {
   id: string;
   title: string;
@@ -66,24 +73,19 @@ export interface PlannerSession {
   customTags?: string[];
   createdAt: string;
   updatedAt: string;
-  profile: StudentProfile;
-  messages: ChatMessage[];
+  profile: import("./profile").StudentProfile;
+  messages: import("./chat").ChatMessage[];
   learningPath: string;
-  resourceWorkspace: ResourceWorkspace;
+  resourceWorkspace: import("./resource").ResourceWorkspace;
 }
 
-export interface TutorMessage {
-  role: "user" | "assistant";
-  content: string;
-  timestamp: Date;
-  topic?: string;
-}
-
+/** 知识库 API 类型 */
 export interface KnowledgeCourse {
   name: string;
   title: string;
   description: string;
   chapter_count: number;
+  search_mode?: string;
 }
 
 export interface KnowledgeChapter {
@@ -92,6 +94,14 @@ export interface KnowledgeChapter {
   keywords: string[];
   file: string;
   exists: boolean;
+}
+
+export interface KnowledgeChapterDetail {
+  id: string;
+  title: string;
+  content: string;
+  summary?: string;
+  keywords: string[];
 }
 
 export interface KnowledgeSearchResult {
@@ -106,4 +116,30 @@ export interface WebSearchResult {
   title: string;
   url: string;
   snippet: string;
+}
+
+export interface CoursesListResponse {
+  courses: KnowledgeCourse[];
+}
+
+export interface ChaptersListResponse {
+  course: string;
+  chapters: KnowledgeChapter[];
+}
+
+export interface KnowledgeSearchResponse {
+  query: string;
+  results: KnowledgeSearchResult[];
+  count: number;
+}
+
+export interface WebSearchResponse {
+  query: string;
+  results: WebSearchResult[];
+  count: number;
+  source?: string;
+}
+
+export interface InitKnowledgeResponse {
+  message: string;
 }

@@ -29,14 +29,33 @@ def _format_stream_error(exc: Exception) -> str:
 async def create_session():
     """创建新的对话 session"""
     session_id = str(uuid.uuid4())
+    await session_store.create_session(session_id)
     return {"session_id": session_id}
+
+
+@router.get("/sessions")
+async def list_sessions():
+    """列出模拟用户的历史会话。"""
+    return {"sessions": await session_store.list_sessions()}
+
+
+@router.get("/session/{session_id}")
+async def get_session_state(session_id: str):
+    """恢复单个 session 的画像和对话历史。"""
+    profile = await session_store.get_profile(session_id)
+    messages = await session_store.get_messages(session_id)
+    return {
+        "session_id": session_id,
+        "profile": profile.model_dump(),
+        "messages": messages,
+    }
 
 
 @router.post("/session/sync")
 async def sync_session(req: SessionSyncRequest):
     """用前端保存的快照恢复当前会话。"""
-    session_store.update_profile(req.profile.model_copy(update={"session_id": req.session_id}))
-    session_store.set_history(
+    await session_store.update_profile(req.profile.model_copy(update={"session_id": req.session_id}))
+    await session_store.set_history(
         req.session_id,
         [{"role": msg.role.value if hasattr(msg.role, "value") else str(msg.role), "content": msg.content} for msg in req.history],
     )
@@ -59,13 +78,13 @@ async def send_message_stream(session_id: str, message: str):
 
     async def event_generator():
         try:
-            initial_profile = profile_agent.infer_and_update_profile(session_id, message)
+            initial_profile = await profile_agent.infer_and_update_profile(session_id, message)
             yield {
                 "event": "profile_update",
                 "data": json.dumps(initial_profile.model_dump(), ensure_ascii=False),
             }
 
-            # profile_agent.chat_stream 内部已过滤 json_profile 块，此处直接转发
+            # profile_agent.chat_stream 内部已过滤 JSON 外壳，此处直接转发
             async for chunk in profile_agent.chat_stream(session_id, message):
                 yield {
                     "event": "delta",
@@ -73,7 +92,7 @@ async def send_message_stream(session_id: str, message: str):
                 }
 
             # 流结束后 profile 已在 chat_stream 内部更新，直接读取推送
-            profile = session_store.get_profile(session_id)
+            profile = await session_store.get_profile(session_id)
             yield {
                 "event": "profile_update",
                 "data": json.dumps(profile.model_dump(), ensure_ascii=False),
@@ -94,12 +113,12 @@ async def send_message_stream(session_id: str, message: str):
 @router.get("/profile/{session_id}")
 async def get_profile(session_id: str):
     """获取当前学生画像"""
-    profile = session_store.get_profile(session_id)
+    profile = await session_store.get_profile(session_id)
     return profile.model_dump()
 
 
 @router.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     """清除 session 数据"""
-    session_store.clear_session(session_id)
+    await session_store.clear_session(session_id)
     return {"message": "session cleared"}

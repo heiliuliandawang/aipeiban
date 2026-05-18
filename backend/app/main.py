@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from app.api import chat, resources, tutor, knowledge
+from app.services import session_store
 
 app = FastAPI(
     title="智学引擎 EduMind API",
@@ -24,6 +25,11 @@ app.include_router(chat.router)
 app.include_router(resources.router)
 app.include_router(tutor.router)
 app.include_router(knowledge.router)
+
+
+@app.on_event("startup")
+async def startup():
+    await session_store.init_db()
 
 
 @app.get("/")

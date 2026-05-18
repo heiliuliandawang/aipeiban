@@ -124,12 +124,12 @@ export default function ChatPanel({ sessionId, messages, onMessagesChange, onPro
         });
       },
       (profileData) => {
-        onProfileUpdate(profileData as StudentProfile);
+        onProfileUpdate(profileData);
       },
       async () => {
         try {
           const latestProfile = await getProfile(sessionId);
-          onProfileUpdate(latestProfile as StudentProfile);
+          onProfileUpdate(latestProfile);
         } catch {
           // ignore profile sync errors and keep the current UI state
         }

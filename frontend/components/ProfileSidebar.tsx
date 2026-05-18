@@ -1,31 +1,49 @@
 "use client";
 
-import type { StudentProfile } from "@/types";
+import type {
+  CognitiveStyle,
+  KnowledgeLevel,
+  LearningGoal,
+  LearningPace,
+  ProfileDimensionKey,
+  StudentProfile,
+} from "@/types";
+import { isProfileDimensionFilled } from "@/types";
 
-const LEVEL_THEME: Record<string, { badge: string; bar: string }> = {
+const LEVEL_THEME: Record<KnowledgeLevel, { badge: string; bar: string }> = {
   入门: { badge: "bg-green-100 text-green-700 border-green-200", bar: "from-green-400 to-emerald-400" },
   初级: { badge: "bg-blue-100 text-blue-700 border-blue-200",  bar: "from-blue-400 to-indigo-400" },
   中级: { badge: "bg-violet-100 text-violet-700 border-violet-200", bar: "from-violet-400 to-purple-500" },
   高级: { badge: "bg-orange-100 text-orange-700 border-orange-200", bar: "from-orange-400 to-red-400" },
 };
 
-const STYLE_ICONS: Record<string, string> = {
+const STYLE_ICONS: Record<CognitiveStyle, string> = {
   视觉型: "👁️",
   逻辑型: "🧠",
   实操型: "🔧",
 };
 
-const GOAL_ICONS: Record<string, string> = {
+const GOAL_ICONS: Record<LearningGoal, string> = {
   考研: "📖",
   竞赛: "🏆",
   就业: "💼",
   兴趣: "❤️",
 };
 
-const PACE_ICONS: Record<string, string> = {
+const PACE_ICONS: Record<LearningPace, string> = {
   快速: "⚡",
   深度: "🔍",
 };
+
+const PROFILE_DIMENSIONS: ProfileDimensionKey[] = [
+  "major",
+  "knowledge_level",
+  "cognitive_style",
+  "learning_goal",
+  "weak_points",
+  "learning_pace",
+  "available_time",
+];
 
 interface Props {
   profile: StudentProfile;
@@ -33,17 +51,10 @@ interface Props {
 }
 
 export default function ProfileSidebar({ profile, onReset }: Props) {
-  const fields = [
-    profile.major,
-    profile.knowledge_level,
-    profile.cognitive_style,
-    profile.learning_goal,
-    profile.weak_points.length > 0 ? true : null,
-    profile.learning_pace,
-    profile.available_time,
-  ];
-  const filledCount = fields.filter(Boolean).length;
-  const total = fields.length;
+  const filledCount = PROFILE_DIMENSIONS.filter((key) =>
+    isProfileDimensionFilled(profile, key)
+  ).length;
+  const total = PROFILE_DIMENSIONS.length;
   const percentage = Math.round((filledCount / total) * 100);
 
   const isComplete = profile.completed_at;
@@ -102,7 +113,7 @@ export default function ProfileSidebar({ profile, onReset }: Props) {
               {profile.knowledge_level ? (
                 <span
                   className={`text-xs font-semibold px-2 py-0.5 rounded-lg mt-0.5 inline-block border ${
-                    LEVEL_THEME[profile.knowledge_level]?.badge || "bg-slate-100 text-slate-600"
+                    LEVEL_THEME[profile.knowledge_level].badge
                   }`}
                 >
                   {profile.knowledge_level}
