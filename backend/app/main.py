@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from app.api import chat, resources, tutor, knowledge
+from app.api import chat, resources, tutor, knowledge, progress
 from app.services import session_store
 
 app = FastAPI(
@@ -15,7 +15,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,6 +30,7 @@ app.include_router(chat.router)
 app.include_router(resources.router)
 app.include_router(tutor.router)
 app.include_router(knowledge.router)
+app.include_router(progress.router)
 
 
 @app.on_event("startup")

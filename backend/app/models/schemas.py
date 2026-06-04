@@ -21,17 +21,26 @@ class ChatRequest(BaseModel):
 
 
 class StudentProfile(BaseModel):
-    """六维学生画像"""
+    """六维学生画像（重构版）"""
     session_id: str
     name: Optional[str] = None
-    major: Optional[str] = None                    # 专业
-    knowledge_level: Optional[str] = None          # 知识基础：入门/初级/中级/高级
-    cognitive_style: Optional[str] = None          # 认知风格：视觉型/逻辑型/实操型
-    learning_goal: Optional[str] = None            # 学习目标：考研/竞赛/就业/兴趣
-    weak_points: List[str] = []                    # 易错点/薄弱知识点
-    learning_pace: Optional[str] = None            # 学习节奏：快速/深度
-    available_time: Optional[str] = None           # 每日可用时间
-    completed_at: bool = False                     # 画像是否构建完整
+    major: Optional[str] = None                         # 专业方向
+
+    # ── 新六维字段 ──────────────────────────────────────────────
+    knowledge_mastery: Optional[float] = None           # 知识掌握度 0.0–1.0
+    learning_preference: Optional[str] = None           # 学习偏好：视觉型/逻辑型/实操型
+    programming_experience: Optional[str] = None        # 编程经验：无/初级/中级/高级
+    # learning_goal / weak_points / learning_pace 沿用原字段名保持兼容
+    learning_goal: Optional[str] = None                 # 学习目标：考研/竞赛/就业/兴趣
+    weak_points: List[str] = []                         # 薄弱知识点列表
+    learning_pace: Optional[str] = None                 # 学习节奏：快速/深度
+
+    # ── 向后兼容旧字段（由 profile_agent 同步写入）────────────────
+    knowledge_level: Optional[str] = None               # 由 knowledge_mastery 推算
+    cognitive_style: Optional[str] = None               # 由 learning_preference 同步
+    available_time: Optional[str] = None                # 每日可用时间
+
+    completed_at: bool = False                          # 画像是否构建完整
 
 
 class SessionSyncRequest(BaseModel):

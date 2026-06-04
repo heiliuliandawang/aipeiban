@@ -5,10 +5,11 @@ import json
 import uuid
 
 from fastapi import APIRouter
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from app.models.schemas import ChatRequest, SessionSyncRequest
-from app.agents import profile_agent
+from app.agents import profile_agent, path_agent
 from app.services import session_store
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -122,3 +123,48 @@ async def clear_session(session_id: str):
     """清除 session 数据"""
     await session_store.clear_session(session_id)
     return {"message": "session cleared"}
+
+
+# ── 学习路径调整 ──────────────────────────────────────────────────────────────
+
+class AdjustPathRequest(BaseModel):
+    session_id: str
+    feedback_text: str
+    """学生反馈，如"题库太难了"、"进度太快想打好基础"。"""
+    current_path: str = ""
+    """当前路径正文（Markdown）；为空时 Agent 将结合画像直接生成新路径再调整。"""
+
+
+@router.post("/path/adjust")
+async def adjust_path_stream(req: AdjustPathRequest):
+    """
+    根据学生反馈流式调整学习路径，返回 SSE 流。
+
+    事件序列：
+      delta      → {"text": "路径内容片段"}
+      done       → ""
+      server_error → {"message": "错误说明"}
+    """
+    async def event_generator():
+        try:
+            profile = await session_store.get_profile(req.session_id)
+            async for chunk in path_agent.adjust_path_stream(
+                current_path=req.current_path,
+                feedback=req.feedback_text,
+                profile=profile,
+            ):
+                yield {
+                    "event": "delta",
+                    "data": json.dumps({"text": chunk}, ensure_ascii=False),
+                }
+        except Exception as exc:
+            yield {
+                "event": "server_error",
+                "data": json.dumps(
+                    {"message": _format_stream_error(exc), "detail": str(exc)},
+                    ensure_ascii=False,
+                ),
+            }
+        yield {"event": "done", "data": ""}
+
+    return EventSourceResponse(event_generator())

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   listCourses,
   listChapters,
@@ -36,6 +36,7 @@ export default function KnowledgePanel() {
 
   const [initializing, setInitializing] = useState(false);
   const [initDone, setInitDone] = useState(false);
+  const searchAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     listCourses().then((data) => {
@@ -68,26 +69,57 @@ export default function KnowledgePanel() {
     setLoadingContent(false);
   }, [selectedCourse]);
 
+  const stopSearch = useCallback(() => {
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+    setSearching(false);
+    setSearchError("已暂停检索");
+  }, []);
+
   const doSearch = useCallback(async () => {
-    if (!searchQuery.trim()) return;
+    if (!searchQuery.trim() || searching) return;
+
+    searchAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    searchAbortRef.current = ctrl;
+
     setSearching(true);
     setMode("search");
     setSearchError("");
     setSearchResults([]);
     setWebResults([]);
+
     try {
       if (searchSource === "web") {
-        const data = await searchKnowledgeWeb(searchQuery.trim());
+        const data = await searchKnowledgeWeb(searchQuery.trim(), 5, ctrl.signal);
+        if (ctrl.signal.aborted) return;
         setWebResults(data.results || []);
       } else {
-        const data = await searchKnowledge(searchQuery, selectedCourse || undefined);
+        const data = await searchKnowledge(
+          searchQuery,
+          selectedCourse || undefined,
+          3,
+          ctrl.signal
+        );
+        if (ctrl.signal.aborted) return;
         setSearchResults(data.results || []);
       }
     } catch (e) {
+      if (ctrl.signal.aborted) return;
       setSearchError(e instanceof Error ? e.message : "搜索失败");
+    } finally {
+      if (searchAbortRef.current === ctrl) {
+        searchAbortRef.current = null;
+      }
+      if (!ctrl.signal.aborted) {
+        setSearching(false);
+      }
     }
-    setSearching(false);
-  }, [searchQuery, selectedCourse, searchSource]);
+  }, [searchQuery, selectedCourse, searchSource, searching]);
+
+  useEffect(() => {
+    return () => searchAbortRef.current?.abort();
+  }, []);
 
   const handleInit = async () => {
     setInitializing(true);
@@ -157,23 +189,49 @@ export default function KnowledgePanel() {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && doSearch()}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && searching) {
+                  e.preventDefault();
+                  stopSearch();
+                  return;
+                }
+                if (e.key === "Enter" && !searching) doSearch();
+              }}
+              disabled={searching}
               placeholder={searchSource === "web" ? "搜索全网学习资料..." : "搜索本地章节..."}
               className="flex-1 border border-slate-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-indigo-400"
             />
-            <button
-              onClick={doSearch}
-              disabled={searching || !searchQuery.trim()}
-              className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs transition-colors"
-            >
-              {searching ? (
-                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            {searching ? (
+              <button
+                type="button"
+                onClick={stopSearch}
+                title="暂停检索"
+                className="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-medium transition-colors flex items-center gap-1"
+              >
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
                 </svg>
-              ) : "🔍"}
-            </button>
+                暂停
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={doSearch}
+                disabled={!searchQuery.trim()}
+                title="开始检索"
+                className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg text-xs transition-colors"
+              >
+                🔍
+              </button>
+            )}
           </div>
+          <p className="text-[10px] text-slate-400 mt-1.5 leading-snug">
+            {searching
+              ? "检索进行中，可点「暂停」或按 Esc 取消"
+              : searchSource === "web"
+                ? "教育类主题优先维基百科，更快更稳"
+                : "在本地《人工智能导论》章节中检索"}
+          </p>
         </div>
 
         {/* 章节列表 */}

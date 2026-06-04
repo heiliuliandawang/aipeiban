@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { getProfile, streamChat } from "@/lib/api";
+import { getProfile, streamChat, streamAdjustPath } from "@/lib/api";
+import { unwrapAgentContent } from "@/lib/agentResponse";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
 import type { ChatMessage, StudentProfile } from "@/types";
 
@@ -23,14 +24,34 @@ const QUICK_STARTS = [
   "我在准备算法竞赛，想系统学习深度学习",
 ];
 
+/** 快速反馈预设文本 */
+const FEEDBACK_PRESETS = [
+  "内容太难了，跟不上",
+  "进度太快，想打好基础",
+  "想多做几道练习题",
+  "内容太简单，想快点进入正题",
+  "某个知识点没听懂",
+];
+
 interface Props {
   sessionId: string;
   messages: ChatMessage[];
   onMessagesChange: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
   onProfileUpdate: (profile: StudentProfile) => void;
+  /** 当前学习路径正文（Markdown）；有值时显示"调整路径"按钮 */
+  currentLearningPath?: string;
+  /** 调整完成后通知父组件更新路径 */
+  onPathAdjusted?: (newPath: string) => void;
 }
 
-export default function ChatPanel({ sessionId, messages, onMessagesChange, onProfileUpdate }: Props) {
+export default function ChatPanel({
+  sessionId,
+  messages,
+  onMessagesChange,
+  onProfileUpdate,
+  currentLearningPath,
+  onPathAdjusted,
+}: Props) {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const composerOuterRef = useRef<HTMLDivElement>(null);
@@ -39,6 +60,12 @@ export default function ChatPanel({ sessionId, messages, onMessagesChange, onPro
   const cleanupRef = useRef<(() => void) | null>(null);
   const manuallyStoppedRef = useRef(false);
   const showQuickStarts = messages.length === 1;
+
+  // ── 路径调整面板状态 ──────────────────────────────────────────────────────
+  const [showAdjustPanel, setShowAdjustPanel] = useState(false);
+  const [adjustFeedback, setAdjustFeedback] = useState("");
+  const [isAdjusting, setIsAdjusting] = useState(false);
+  const adjustCleanupRef = useRef<(() => void) | null>(null);
 
   const lastMessage = messages[messages.length - 1];
   const { containerRef, endRef, handleScroll } = useChatAutoScroll({
@@ -71,9 +98,83 @@ export default function ChatPanel({ sessionId, messages, onMessagesChange, onPro
       cleanupRef.current();
       cleanupRef.current = null;
     }
+    adjustCleanupRef.current?.();
+    adjustCleanupRef.current = null;
     setIsLoading(false);
+    setIsAdjusting(false);
+    setShowAdjustPanel(false);
+    setAdjustFeedback("");
     setInput("");
   }, [sessionId]);
+
+  // ── 路径调整提交 ──────────────────────────────────────────────────────────
+  const submitAdjustPath = useCallback(() => {
+    const feedback = adjustFeedback.trim();
+    if (!feedback || isAdjusting || !sessionId) return;
+
+    setIsAdjusting(true);
+    setShowAdjustPanel(false);
+
+    // 在对话中显示用户反馈消息和占位回复
+    const userMsg: ChatMessage = {
+      role: "user",
+      content: `🗺️ 路径调整请求：${feedback}`,
+      timestamp: new Date(),
+    };
+    const assistantMsg: ChatMessage = {
+      role: "assistant",
+      content: "",
+      timestamp: new Date(),
+    };
+    onMessagesChange((prev) => [...prev, userMsg, assistantMsg]);
+
+    let accumulated = "";
+    adjustCleanupRef.current = streamAdjustPath(
+      {
+        session_id: sessionId,
+        feedback_text: feedback,
+        current_path: currentLearningPath || "",
+      },
+      (chunk) => {
+        accumulated += chunk;
+        onMessagesChange((prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1] = {
+            ...updated[updated.length - 1],
+            content: accumulated,
+          };
+          return updated;
+        });
+      },
+      () => {
+        adjustCleanupRef.current = null;
+        setIsAdjusting(false);
+        setAdjustFeedback("");
+        onPathAdjusted?.(unwrapAgentContent(accumulated));
+      },
+      (errorMessage) => {
+        onMessagesChange((prev) => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (!last || last.role !== "assistant") return prev;
+          updated[updated.length - 1] = {
+            ...last,
+            content: last.content || `抱歉，路径调整失败。\n\n${errorMessage}`,
+          };
+          return updated;
+        });
+        adjustCleanupRef.current = null;
+        setIsAdjusting(false);
+      }
+    );
+  }, [
+    adjustFeedback,
+    isAdjusting,
+    sessionId,
+    currentLearningPath,
+    onMessagesChange,
+    onPathAdjusted,
+  ]);
 
   const stopStreaming = useCallback(() => {
     if (!isLoading) return;
@@ -208,7 +309,86 @@ export default function ChatPanel({ sessionId, messages, onMessagesChange, onPro
         ref={composerOuterRef}
         className="flex-shrink-0 border-t border-slate-200 bg-white px-4 py-3"
       >
+        {/* ── 路径调整内联面板 ── */}
+        {showAdjustPanel && (
+          <div className="max-w-3xl mx-auto mb-3 rounded-2xl border border-indigo-200 bg-indigo-50 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-indigo-700 flex items-center gap-1.5">
+                🗺️ 路径调整反馈
+              </span>
+              <button
+                onClick={() => { setShowAdjustPanel(false); setAdjustFeedback(""); }}
+                className="text-slate-400 hover:text-slate-600 text-xs transition-colors"
+              >
+                ✕ 取消
+              </button>
+            </div>
+
+            {/* 快速预设 */}
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {FEEDBACK_PRESETS.map((preset) => (
+                <button
+                  key={preset}
+                  onClick={() => setAdjustFeedback(preset)}
+                  className={`text-xs px-2.5 py-1 rounded-full border transition-all ${
+                    adjustFeedback === preset
+                      ? "bg-indigo-600 text-white border-indigo-600"
+                      : "bg-white text-indigo-600 border-indigo-200 hover:bg-indigo-100"
+                  }`}
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
+
+            {/* 自定义输入 */}
+            <textarea
+              value={adjustFeedback}
+              onChange={(e) => setAdjustFeedback(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  submitAdjustPath();
+                }
+              }}
+              placeholder="或输入自定义反馈，如「第二阶段的卷积内容太快了」..."
+              rows={2}
+              className="w-full bg-white border border-indigo-200 rounded-xl px-3 py-2 text-sm text-slate-700 placeholder-slate-400 resize-none outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 transition-all"
+            />
+
+            <div className="flex justify-end mt-2">
+              <button
+                onClick={submitAdjustPath}
+                disabled={!adjustFeedback.trim()}
+                className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-xl text-xs font-semibold transition-all"
+              >
+                提交调整
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="max-w-3xl mx-auto flex gap-3 items-end">
+          {/* "调整路径"入口按钮 */}
+          {currentLearningPath && !isLoading && !isAdjusting && !showAdjustPanel && (
+            <button
+              onClick={() => setShowAdjustPanel(true)}
+              title="根据学习情况调整路径"
+              className="flex-shrink-0 h-10 px-3 text-xs font-medium text-indigo-600 bg-indigo-50 border border-indigo-200 rounded-xl hover:bg-indigo-100 transition-all flex items-center gap-1.5 whitespace-nowrap"
+            >
+              🗺️ 调整路径
+            </button>
+          )}
+          {isAdjusting && (
+            <div className="flex-shrink-0 h-10 px-3 text-xs font-medium text-indigo-500 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center gap-1.5 whitespace-nowrap">
+              <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              路径调整中…
+            </div>
+          )}
+
           <div className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl focus-within:border-indigo-400 focus-within:ring-2 focus-within:ring-indigo-100 transition-all shadow-sm">
             <textarea
               ref={inputRef}
@@ -217,7 +397,7 @@ export default function ChatPanel({ sessionId, messages, onMessagesChange, onPro
               onKeyDown={handleKeyDown}
               placeholder={isLoading ? "正在回复中，可点击“暂停”后补充或更正..." : "输入消息，Enter 发送，Shift+Enter 换行..."}
               rows={2}
-              disabled={!sessionId}
+              disabled={!sessionId || isAdjusting}
               className="w-full bg-transparent px-4 py-3 text-sm text-slate-700 placeholder-slate-400 resize-none outline-none"
             />
           </div>
@@ -229,7 +409,7 @@ export default function ChatPanel({ sessionId, messages, onMessagesChange, onPro
               }
               sendMessage();
             }}
-            disabled={(!isLoading && !input.trim()) || !sessionId}
+            disabled={(!isLoading && !input.trim()) || !sessionId || isAdjusting}
             className={`flex-shrink-0 w-10 h-10 text-white rounded-xl flex items-center justify-center transition-all shadow-sm hover:shadow-md disabled:shadow-none ${
               isLoading
                 ? "bg-gradient-to-br from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600"

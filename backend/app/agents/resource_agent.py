@@ -13,6 +13,8 @@ import os
 from typing import AsyncGenerator
 
 from app.services import llm_service
+from app.services.content_filter import content_filter
+from app.services.fact_checker import check_facts
 from app.models.schemas import StudentProfile, ResourceType
 
 logger = logging.getLogger(__name__)
@@ -69,14 +71,9 @@ def _profile_adaptation_rule() -> str:
 
 
 def _content_from_agent_response(raw: str) -> str:
-    """LLM 被要求输出 JSON；接口仍返回 content，避免前端展示 JSON 外壳。"""
-    try:
-        data = json.loads(raw.strip())
-    except json.JSONDecodeError:
-        return raw
-    if isinstance(data, dict) and isinstance(data.get("content"), str):
-        return data["content"]
-    return raw
+    from app.agents.agent_response import content_from_agent_response
+
+    return content_from_agent_response(raw)
 
 
 def _doc_prompt(topic: str, profile: StudentProfile) -> list[dict]:
@@ -264,8 +261,14 @@ async def _generate_single(
     messages = builder(topic, profile)
     async with _resource_llm_sem:
         raw = await llm_service.chat_completion(messages, temperature=0.6)
-    return resource_type, _content_from_agent_response(raw)
-
+    content = _content_from_agent_response(raw)
+    filtered, detected = content_filter.filter_text(content)
+    if detected:
+        logger.warning("resource_agent filtered %d sensitive patterns in %s", len(detected), resource_type)
+    fact_result = await check_facts(filtered)
+    if fact_result["confidence"] < 0.4:
+        logger.warning("resource_agent low confidence %.2f for %s", fact_result["confidence"], resource_type)
+    return resource_type, filtered
 
 async def generate_resources(
     topic: str,

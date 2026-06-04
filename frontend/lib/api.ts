@@ -1,4 +1,6 @@
+﻿import { unwrapAgentContent } from "@/lib/agentResponse";
 import type {
+  AdjustPathRequest,
   ChatDeltaEvent,
   ChatServerErrorEvent,
   ClearSessionResponse,
@@ -9,6 +11,9 @@ import type {
   KnowledgeChapterDetail,
   KnowledgeSearchResponse,
   ListSessionsResponse,
+  MarkChapterRequest,
+  ProgressSummary,
+  RecordQuizScoreRequest,
   SessionSyncRequest,
   SessionStateResponse,
   SessionSyncResponse,
@@ -17,6 +22,7 @@ import type {
   SuggestedQuestionsResponse,
   TutorAskRequest,
   TutorDeltaEvent,
+  TutorHistoryResponse,
   WebSearchResponse,
 } from "@/types";
 import type {
@@ -48,9 +54,7 @@ export async function listSessions(): Promise<ListSessionsResponse> {
   return parseJsonResponse<ListSessionsResponse>(res);
 }
 
-export async function getSessionState(
-  sessionId: string
-): Promise<SessionStateResponse> {
+export async function getSessionState(sessionId: string): Promise<SessionStateResponse> {
   const res = await fetch(`${BASE_URL}/chat/session/${sessionId}`);
   return parseJsonResponse<SessionStateResponse>(res);
 }
@@ -60,9 +64,7 @@ export async function getProfile(sessionId: string): Promise<StudentProfile> {
   return parseJsonResponse<StudentProfile>(res);
 }
 
-export async function syncSessionState(
-  params: SessionSyncRequest
-): Promise<SessionSyncResponse> {
+export async function syncSessionState(params: SessionSyncRequest): Promise<SessionSyncResponse> {
   const res = await fetch(`${BASE_URL}/chat/session/sync`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -71,16 +73,11 @@ export async function syncSessionState(
   return parseJsonResponse<SessionSyncResponse>(res);
 }
 
-export async function clearChatSession(
-  sessionId: string
-): Promise<ClearSessionResponse> {
-  const res = await fetch(`${BASE_URL}/chat/session/${sessionId}`, {
-    method: "DELETE",
-  });
+export async function clearChatSession(sessionId: string): Promise<ClearSessionResponse> {
+  const res = await fetch(`${BASE_URL}/chat/session/${sessionId}`, { method: "DELETE" });
   return parseJsonResponse<ClearSessionResponse>(res);
 }
 
-/** 流式对话，通过 EventSource SSE 逐字返回 */
 export function streamChat(
   sessionId: string,
   message: string,
@@ -105,16 +102,14 @@ export function streamChat(
 
   es.addEventListener("delta", (e: Event) => {
     const data = parseSseJson<ChatDeltaEvent>((e as MessageEvent<string>).data);
-    onDelta(data.text);
+    onDelta(unwrapAgentContent(data.text));
   });
 
   es.addEventListener("profile_update", (e: Event) => {
     onProfileUpdate(parseSseJson<StudentProfile>((e as MessageEvent<string>).data));
   });
 
-  es.addEventListener("done", () => {
-    finish();
-  });
+  es.addEventListener("done", () => finish());
 
   es.addEventListener("server_error", (e: Event) => {
     try {
@@ -134,60 +129,66 @@ export function streamChat(
 }
 
 function isResourceType(value: string): value is ResourceType {
-  return (
-    value === "document" ||
-    value === "quiz" ||
-    value === "mindmap" ||
-    value === "code_example" ||
-    value === "reading"
-  );
+  return ["document", "quiz", "mindmap", "code_example", "reading"].includes(value);
 }
 
-/** 解析 fetch ReadableStream 上的 SSE 行 */
+type SseEventName =
+  | ResourceStreamEventName
+  | "delta"
+  | "done"
+  | "profile_update"
+  | "server_error";
+
 async function consumeFetchSse(
   body: ReadableStream<Uint8Array>,
-  onEvent: (event: ResourceStreamEventName | "delta" | "done", data: string) => void
+  onEvent: (event: SseEventName, data: string) => void
 ): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let currentEvent = "";
+
+  const dispatchLine = (line: string) => {
+    const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
+    if (normalized.startsWith("event: ")) {
+      currentEvent = normalized.slice(7).trim();
+    } else if (normalized.startsWith("data:")) {
+      const raw = normalized.slice(5).trimStart();
+      if (!raw) {
+        if (currentEvent === "done") onEvent("done", "");
+        return;
+      }
+      onEvent((currentEvent || "message") as SseEventName, raw);
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split("\n");
+    const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || "";
-
-    let currentEvent = "";
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith("data: ")) {
-        const raw = line.slice(6).trim();
-        if (!raw) continue;
-        onEvent(currentEvent as ResourceStreamEventName | "delta" | "done", raw);
-      }
-    }
+    for (const line of lines) dispatchLine(line);
   }
-}
 
-/** 流式资源生成；返回的函数为「暂停/取消」 */
+  if (buffer.trim()) dispatchLine(buffer);
+}
 export function streamGenerateResources(
   params: GenerateResourcesRequest,
   onProgress: (type: ResourceType, label: string, status: string) => void,
   onResource: (type: ResourceType, label: string, content: string) => void,
   onDone: () => void,
+  onError: (message: string) => void,
   onAbort?: () => void
 ): StreamCancelFn {
   const ctrl = new AbortController();
   let settled = false;
+  let errored = false;
   const settle = (mode: "done" | "abort") => {
     if (settled) return;
     settled = true;
     if (mode === "abort") onAbort?.();
-    else onDone();
+    else if (!errored) onDone();
   };
 
   (async () => {
@@ -200,50 +201,68 @@ export function streamGenerateResources(
       });
 
       if (!res.ok) {
-        console.error(
-          "[streamGenerateResources] HTTP",
-          res.status,
-          await res.text().catch(() => "")
+        const detail = await res.text().catch(() => "");
+        console.error("[streamGenerateResources] HTTP", res.status, detail);
+        errored = true;
+        onError(
+          res.status === 0
+            ? "无法连接后端，请确认 http://localhost:8000 已启动。"
+            : `资源生成请求失败（HTTP ${res.status}）${detail ? `：${detail.slice(0, 120)}` : ""}`
         );
-        settle("done");
         return;
       }
       if (!res.body) {
-        settle("done");
+        errored = true;
+        onError("资源生成流为空，请稍后重试。");
         return;
       }
 
       let shouldStop = false;
+      let receivedResource = false;
       await consumeFetchSse(res.body, (currentEvent, raw) => {
         if (shouldStop) return;
         try {
           if (currentEvent === "progress") {
             const data = parseSseJson<ResourceProgressEvent>(raw);
-            if (isResourceType(data.type)) {
-              onProgress(data.type, data.label, data.status);
-            }
+            if (isResourceType(data.type)) onProgress(data.type, data.label, data.status);
           } else if (currentEvent === "resource") {
             const data = parseSseJson<ResourceContentEvent>(raw);
             if (isResourceType(data.type)) {
-              onResource(data.type, data.label, data.content);
+              receivedResource = true;
+              onResource(data.type, data.label, unwrapAgentContent(data.content));
             }
           } else if (currentEvent === "server_error") {
             const data = parseSseJson<ResourceServerErrorEvent>(raw);
             console.error("[streamGenerateResources] server_error", data.message);
+            errored = true;
+            onError(data.message || "资源生成失败，请检查模型 API 配置。");
           } else if (currentEvent === "done") {
             shouldStop = true;
-            settle("done");
+            if (!errored && !receivedResource) {
+              errored = true;
+              onError("未收到任何资源内容，请检查 backend/.env 中的星火 API 配置，或先只选 1 种类型重试。");
+            } else {
+              settle("done");
+            }
           }
-        } catch {
-          // ignore parse errors
+        } catch (err) {
+          console.error("[streamGenerateResources] parse event", currentEvent, err);
         }
       });
-      settle("done");
+      if (!errored) {
+        if (!receivedResource) {
+          errored = true;
+          onError("未收到任何资源内容，请检查后端日志或 API 配置。");
+        } else {
+          settle("done");
+        }
+      }
     } catch (e) {
       if (ctrl.signal.aborted) settle("abort");
       else {
         console.error("[streamGenerateResources]", e);
-        settle("done");
+        errored = true;
+        onError("无法连接后端，请确认服务已启动且浏览器未拦截跨域请求。");
       }
     }
   })();
@@ -256,20 +275,16 @@ export async function getLearningPath(
   profile: StudentProfile,
   course = "人工智能导论"
 ): Promise<LearningPathResponse> {
-  const body: LearningPathRequest = {
-    session_id: sessionId,
-    course,
-    profile,
-  };
+  const body: LearningPathRequest = { session_id: sessionId, course, profile };
   const res = await fetch(`${BASE_URL}/resources/learning-path`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return parseJsonResponse<LearningPathResponse>(res);
+  const data = await parseJsonResponse<LearningPathResponse>(res);
+  return { path: unwrapAgentContent(data.path || "") };
 }
 
-/** 流式辅导问答，fetch + SSE 逐字回复 */
 export function streamTutorAsk(
   params: TutorAskRequest,
   onDelta: (text: string) => void,
@@ -303,7 +318,7 @@ export function streamTutorAsk(
             onDone();
           }
         } catch {
-          // ignore parse errors
+          // ignore
         }
       });
       onDone();
@@ -315,16 +330,21 @@ export function streamTutorAsk(
   return () => ctrl.abort();
 }
 
-/** 获取推荐问题列表 */
+export async function getTutorHistory(sessionId: string): Promise<TutorHistoryResponse> {
+  const res = await fetch(`${BASE_URL}/tutor/history/${sessionId}`);
+  return parseJsonResponse<TutorHistoryResponse>(res);
+}
+
+export async function clearTutorHistory(sessionId: string): Promise<{ message: string }> {
+  const res = await fetch(`${BASE_URL}/tutor/history/${sessionId}`, { method: "DELETE" });
+  return parseJsonResponse<{ message: string }>(res);
+}
+
 export async function getSuggestedQuestions(topic: string): Promise<string[]> {
-  const res = await fetch(
-    `${BASE_URL}/tutor/suggested-questions?topic=${encodeURIComponent(topic)}`
-  );
+  const res = await fetch(`${BASE_URL}/tutor/suggested-questions?topic=${encodeURIComponent(topic)}`);
   const data = await parseJsonResponse<SuggestedQuestionsResponse>(res);
   return data.questions || [];
 }
-
-// ── 知识库 API ──────────────────────────────────────────
 
 export async function initKnowledge(): Promise<InitKnowledgeResponse> {
   const res = await fetch(`${BASE_URL}/knowledge/init`);
@@ -337,46 +357,106 @@ export async function listCourses(): Promise<CoursesListResponse> {
 }
 
 export async function listChapters(courseName: string): Promise<ChaptersListResponse> {
-  const res = await fetch(
-    `${BASE_URL}/knowledge/courses/${encodeURIComponent(courseName)}/chapters`
-  );
+  const res = await fetch(`${BASE_URL}/knowledge/courses/${encodeURIComponent(courseName)}/chapters`);
   return parseJsonResponse<ChaptersListResponse>(res);
 }
 
-export async function getChapter(
-  courseName: string,
-  chapterId: string
-): Promise<KnowledgeChapterDetail> {
-  const res = await fetch(
-    `${BASE_URL}/knowledge/courses/${encodeURIComponent(courseName)}/chapters/${chapterId}`
-  );
+export async function getChapter(courseName: string, chapterId: string): Promise<KnowledgeChapterDetail> {
+  const res = await fetch(`${BASE_URL}/knowledge/courses/${encodeURIComponent(courseName)}/chapters/${chapterId}`);
   return parseJsonResponse<KnowledgeChapterDetail>(res);
 }
 
-export async function searchKnowledge(
-  query: string,
-  course?: string,
-  topK = 3
-): Promise<KnowledgeSearchResponse> {
+export async function searchKnowledge(query: string, course?: string, topK = 3, signal?: AbortSignal): Promise<KnowledgeSearchResponse> {
   const params = new URLSearchParams({ q: query, top_k: String(topK) });
   if (course) params.set("course", course);
-  const res = await fetch(`${BASE_URL}/knowledge/search?${params}`);
+  const res = await fetch(`${BASE_URL}/knowledge/search?${params}`, { signal });
   return parseJsonResponse<KnowledgeSearchResponse>(res);
 }
 
-export async function searchKnowledgeWeb(
-  query: string,
-  topK = 8
-): Promise<WebSearchResponse> {
+export function streamAdjustPath(params: AdjustPathRequest, onDelta: (text: string) => void, onDone: () => void, onError: (message: string) => void): StreamCancelFn {
+  const ctrl = new AbortController();
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    onDone();
+  };
+
+  (async () => {
+    try {
+      const res = await fetch(`${BASE_URL}/chat/path/adjust`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+        signal: ctrl.signal,
+      });
+
+      if (!res.ok || !res.body) {
+        onError("路径调整服务暂时不可用，请稍后重试。");
+        settle();
+        return;
+      }
+
+      let shouldStop = false;
+      await consumeFetchSse(res.body, (event, raw) => {
+        if (shouldStop) return;
+        try {
+          if (event === "delta") {
+            const data = parseSseJson<ChatDeltaEvent>(raw);
+            onDelta(unwrapAgentContent(data.text));
+          } else if (event === "done") {
+            shouldStop = true;
+            settle();
+          } else if (event === "server_error") {
+            const data = parseSseJson<{ message: string }>(raw);
+            onError(data.message || "路径调整失败，请重试。");
+          }
+        } catch {
+          // ignore
+        }
+      });
+      settle();
+    } catch (e) {
+      if (!ctrl.signal.aborted) onError("连接中断，请检查后端服务。");
+      settle();
+    }
+  })();
+
+  return () => ctrl.abort();
+}
+
+export async function searchKnowledgeWeb(query: string, topK = 8, signal?: AbortSignal): Promise<WebSearchResponse> {
   const params = new URLSearchParams({ q: query, top_k: String(topK) });
-  const res = await fetch(`${BASE_URL}/knowledge/web-search?${params}`);
+  const res = await fetch(`${BASE_URL}/knowledge/web-search?${params}`, { signal });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    const detail =
-      typeof err === "object" && err !== null && "detail" in err
-        ? String((err as { detail: unknown }).detail)
-        : "联网检索失败";
+    const detail = typeof err === "object" && err !== null && "detail" in err ? String((err as { detail: unknown }).detail) : "联网检索失败";
     throw new Error(detail);
   }
   return parseJsonResponse<WebSearchResponse>(res);
+}
+
+export async function markChapterComplete(sessionId: string, course: string, chapterId: string): Promise<{ message: string; chapter_id: string }> {
+  const body: MarkChapterRequest = { session_id: sessionId, course, chapter_id: chapterId };
+  const res = await fetch(`${BASE_URL}/progress/chapter/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseJsonResponse<{ message: string; chapter_id: string }>(res);
+}
+
+export async function recordQuizScore(sessionId: string, quizTopic: string, score: number, total: number): Promise<{ message: string; percentage: number }> {
+  const body: RecordQuizScoreRequest = { session_id: sessionId, quiz_topic: quizTopic, score, total };
+  const res = await fetch(`${BASE_URL}/progress/quiz/score`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseJsonResponse<{ message: string; percentage: number }>(res);
+}
+
+export async function getProgressSummary(sessionId: string): Promise<ProgressSummary> {
+  const res = await fetch(`${BASE_URL}/progress/summary/${sessionId}`);
+  return parseJsonResponse<ProgressSummary>(res);
 }

@@ -48,6 +48,13 @@ async def get_suggested_questions(topic: str = ""):
     return {"topic": topic, "questions": questions}
 
 
+@router.get("/history/{session_id}")
+async def get_history(session_id: str, limit: int = 50):
+    """获取辅导对话历史（供前端恢复会话）"""
+    messages = await session_store.get_tutor_history(session_id, limit=limit)
+    return {"session_id": session_id, "messages": messages}
+
+
 @router.delete("/history/{session_id}")
 async def clear_history(session_id: str):
     """清除辅导对话历史"""

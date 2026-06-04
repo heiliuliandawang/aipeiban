@@ -8,21 +8,29 @@ import {
   listSessions as listBackendSessions,
   syncSessionState,
 } from "@/lib/api";
+import { unwrapAgentContent } from "@/lib/agentResponse";
 import ProfileSidebar from "@/components/ProfileSidebar";
 import ChatPanel, { createWelcomeMessage } from "@/components/ChatPanel";
 import ResourcePanel from "@/components/ResourcePanel";
 import TutorPanel from "@/components/TutorPanel";
 import KnowledgePanel from "@/components/KnowledgePanel";
+import ProgressPanel from "@/components/ProgressPanel";
+import SortableLearningPath from "@/components/SortableLearningPath";
 import type {
   ApiChatMessage,
   ChatMessage,
   PlannerSession,
   ResourceWorkspace,
   StudentProfile,
+  TutorWorkspace,
 } from "@/types";
-import { createEmptyProfile } from "@/types";
+import {
+  createEmptyProfile,
+  createEmptyTutorWorkspace,
+  createTutorWelcomeMessage,
+} from "@/types";
 
-type ActiveTab = "chat" | "resources" | "path" | "tutor" | "knowledge";
+type ActiveTab = "chat" | "resources" | "path" | "tutor" | "knowledge" | "progress";
 
 const STORAGE_KEY = "edumind-planner-sessions-v1";
 const SESSION_ID_KEY = "edumind-session-id";
@@ -33,6 +41,7 @@ const TABS: { id: ActiveTab; label: string; icon: string; desc: string }[] = [
   { id: "path", label: "学习路径", icon: "🗺️", desc: "智能规划顺序" },
   { id: "tutor", label: "智能辅导", icon: "🧑‍🏫", desc: "即时答疑解惑" },
   { id: "knowledge", label: "学习检索", icon: "📚", desc: "本地章节与联网搜索" },
+  { id: "progress", label: "学习进度", icon: "📊", desc: "追踪章节、测试、理解度" },
 ];
 const DEFAULT_RESOURCE_TYPES = ["document", "quiz", "mindmap", "code_example", "reading"] as const;
 
@@ -70,6 +79,7 @@ function createPlannerSessionSnapshot(sessionId: string, fallbackIndex: number):
     messages: [createWelcomeMessage()],
     learningPath: "",
     resourceWorkspace: createEmptyResourceWorkspace(),
+    tutorWorkspace: createEmptyTutorWorkspace(),
   };
 }
 
@@ -81,7 +91,10 @@ function createPlannerSessionFromBackend(
   const messages = state.messages.length
     ? state.messages.map((message) => ({
         role: message.role,
-        content: message.content,
+        content:
+          message.role === "assistant"
+            ? unwrapAgentContent(message.content)
+            : message.content,
         timestamp: new Date(message.timestamp),
       }))
     : [createWelcomeMessage()];
@@ -124,6 +137,9 @@ function normalizeSessions(sessions: PlannerSession[]) {
         taskStatuses: session.resourceWorkspace?.taskStatuses || {},
         resources: session.resourceWorkspace?.resources || [],
       },
+      tutorWorkspace: session.tutorWorkspace
+        ? restoreTutorWorkspace(session.tutorWorkspace)
+        : createEmptyTutorWorkspace(),
     }))
   );
 }
@@ -146,19 +162,46 @@ function restoreSessions(raw: unknown): PlannerSession[] {
         updatedAt: value.updatedAt || value.createdAt || new Date().toISOString(),
         profile: { ...createEmptyProfile(value.id || `restored-${index}`), ...value.profile },
         messages:
-          value.messages?.map((message) => ({
-            role: message.role === "user" ? "user" : "assistant",
-            content: message.content || "",
-            timestamp: message.timestamp ? new Date(message.timestamp) : new Date(),
-          })) || [createWelcomeMessage()],
+          value.messages?.map((message) => {
+            const role = message.role === "user" ? "user" : "assistant";
+            const raw = message.content || "";
+            return {
+              role,
+              content: role === "assistant" ? unwrapAgentContent(raw) : raw,
+              timestamp: message.timestamp ? new Date(message.timestamp) : new Date(),
+            };
+          }) || [createWelcomeMessage()],
         learningPath: value.learningPath || "",
         resourceWorkspace: {
           ...createEmptyResourceWorkspace(),
           ...(value.resourceWorkspace || {}),
         },
+        tutorWorkspace: restoreTutorWorkspace(value.tutorWorkspace),
       };
     })
   );
+}
+
+function restoreTutorWorkspace(raw: unknown): TutorWorkspace {
+  const empty = createEmptyTutorWorkspace();
+  if (!raw || typeof raw !== "object") return empty;
+
+  const value = raw as Partial<TutorWorkspace> & {
+    messages?: Array<{ role?: string; content?: string; timestamp?: string; topic?: string }>;
+  };
+
+  const messages =
+    value.messages?.map((msg) => ({
+      role: msg.role === "user" ? ("user" as const) : ("assistant" as const),
+      content: msg.content || "",
+      timestamp: msg.timestamp ? new Date(msg.timestamp) : new Date(),
+      topic: msg.topic,
+    })) || empty.messages;
+
+  return {
+    messages: messages.length > 0 ? messages : [createTutorWelcomeMessage()],
+    currentTopic: value.currentTopic || "",
+  };
 }
 
 function buildBackendHistory(messages: ChatMessage[]): ApiChatMessage[] {
@@ -595,9 +638,10 @@ export default function Home() {
   const updateActivePath = useCallback(
     (path: string) => {
       if (!activeSessionId) return;
+      const clean = unwrapAgentContent(path);
       updateSession(activeSessionId, (session) => ({
         ...session,
-        learningPath: path,
+        learningPath: clean,
       }));
     },
     [activeSessionId, updateSession]
@@ -967,6 +1011,8 @@ export default function Home() {
               messages={activeSession.messages}
               onMessagesChange={updateActiveMessages}
               onProfileUpdate={updateActiveProfile}
+              currentLearningPath={activeSession.learningPath}
+              onPathAdjusted={updateActivePath}
             />
           )}
           {activeTab === "resources" && (
@@ -974,7 +1020,12 @@ export default function Home() {
               sessionId={activeSession.id}
               profile={activeSession.profile}
               workspace={activeSession.resourceWorkspace}
-              onWorkspaceChange={updateActiveResourceWorkspace}
+              onWorkspaceChange={(updater) =>
+                updateSession(activeSession.id, (session) => ({
+                  ...session,
+                  resourceWorkspace: updater(session.resourceWorkspace),
+                }))
+              }
             />
           )}
           {activeTab === "path" && (
@@ -988,9 +1039,25 @@ export default function Home() {
             />
           )}
           {activeTab === "tutor" && (
-            <TutorPanel sessionId={activeSession.id} profile={activeSession.profile} />
+            <TutorPanel
+              sessionId={activeSession.id}
+              profile={activeSession.profile}
+              workspace={activeSession.tutorWorkspace}
+              onWorkspaceChange={(updater) =>
+                updateSession(activeSession.id, (session) => ({
+                  ...session,
+                  tutorWorkspace: updater(session.tutorWorkspace),
+                }))
+              }
+            />
           )}
           {activeTab === "knowledge" && <KnowledgePanel />}
+          {activeTab === "progress" && (
+            <ProgressPanel
+              sessionId={activeSession.id}
+              profile={activeSession.profile}
+            />
+          )}
         </div>
       </main>
     </div>
@@ -1012,6 +1079,8 @@ function LearningPathPanel({
   onPathChange: (path: string) => void;
   onLoadingChange: (loading: boolean) => void;
 }) {
+  const cleanPath = useMemo(() => unwrapAgentContent(path), [path]);
+
   const generate = async () => {
     if (!profile.knowledge_level) {
       alert("请先在「学习对话」中完成画像构建");
@@ -1028,9 +1097,9 @@ function LearningPathPanel({
   };
 
   const exportPath = () => {
-    if (!path) return;
+    if (!cleanPath) return;
 
-    const blob = new Blob([path], { type: "text/markdown;charset=utf-8" });
+    const blob = new Blob([cleanPath], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     const date = new Date().toISOString().slice(0, 10);
@@ -1050,11 +1119,11 @@ function LearningPathPanel({
           <p className="text-sm text-slate-500 mt-1">基于您的学习画像，智能规划《人工智能导论》学习顺序</p>
         </div>
         <div className="flex items-center gap-2">
-          {path && (
+          {cleanPath && (
             <>
               <button
                 onClick={() => {
-                  navigator.clipboard.writeText(path);
+                  navigator.clipboard.writeText(cleanPath);
                 }}
                 className="flex items-center gap-1.5 px-3 py-2 text-xs text-slate-500 hover:text-indigo-600 bg-white border border-slate-200 rounded-xl transition-colors shadow-sm"
               >
@@ -1119,17 +1188,20 @@ function LearningPathPanel({
         </div>
       )}
 
-      {path && (
+      {cleanPath && (
         <div className="flex-1 overflow-y-auto bg-white rounded-2xl border border-slate-200 shadow-sm animate-scale-in">
           <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50 rounded-t-2xl">
             <div className="flex items-center gap-2">
               <span className="text-lg">🗺️</span>
               <span className="font-semibold text-slate-700">人工智能导论 · 个性化学习路径</span>
             </div>
-            <span className="text-xs text-slate-400">已自动保留到当前计划，切换会话或标签后仍可继续查看</span>
+            <span className="text-xs text-slate-400">可拖拽调整章节顺序</span>
           </div>
           <div className="p-6">
-            <MarkdownRenderer content={path} />
+            <SortableLearningPath
+              markdown={cleanPath}
+              onReorder={(newMarkdown) => onPathChange(newMarkdown)}
+            />
           </div>
         </div>
       )}

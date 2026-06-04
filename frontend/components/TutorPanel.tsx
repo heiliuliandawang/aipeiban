@@ -2,8 +2,22 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
-import { streamTutorAsk, getSuggestedQuestions } from "@/lib/api";
-import type { TutorMessage, StudentProfile } from "@/types";
+import {
+  streamTutorAsk,
+  getSuggestedQuestions,
+  getTutorHistory,
+  clearTutorHistory,
+} from "@/lib/api";
+import { downloadTutorTranscript } from "@/lib/tutorExport";
+import type {
+  TutorMessage,
+  StudentProfile,
+  TutorWorkspace,
+} from "@/types";
+import {
+  createTutorWelcomeMessage,
+  createEmptyTutorWorkspace,
+} from "@/types";
 
 const TOPICS = [
   "AI概述与发展历史",
@@ -15,28 +29,31 @@ const TOPICS = [
   "强化学习基础",
 ];
 
-const WELCOME: TutorMessage = {
-  role: "assistant",
-  content:
-    "你好！我是你的专属辅导助手 🧑‍🏫\n\n遇到不懂的知识点，直接问我吧！我会根据你的学习画像，用最适合你的方式来解释。\n\n**你可以：**\n- 选择正在学习的主题，系统会推荐常见问题\n- 直接输入任何问题\n- 针对我的回答继续追问",
-  timestamp: new Date(),
-};
-
 interface Props {
   sessionId: string;
   profile: StudentProfile;
+  workspace: TutorWorkspace;
+  onWorkspaceChange: (updater: (prev: TutorWorkspace) => TutorWorkspace) => void;
 }
 
-export default function TutorPanel({ sessionId, profile }: Props) {
-  const [messages, setMessages] = useState<TutorMessage[]>([WELCOME]);
+export default function TutorPanel({
+  sessionId,
+  profile,
+  workspace,
+  onWorkspaceChange,
+}: Props) {
+  const { messages, currentTopic } = workspace;
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [currentTopic, setCurrentTopic] = useState("");
   const [suggestedQuestions, setSuggestedQuestions] = useState<string[]>([]);
   const [showTopicPicker, setShowTopicPicker] = useState(false);
+  const [saveHint, setSaveHint] = useState<string | null>(null);
   const composerOuterRef = useRef<HTMLDivElement>(null);
   const [composerHeight, setComposerHeight] = useState(0);
   const stopRef = useRef<(() => void) | null>(null);
+  const loadedBackendRef = useRef<string | null>(null);
+
+  const userMessageCount = messages.filter((m) => m.role === "user").length;
 
   const lastMessage = messages[messages.length - 1];
   const { containerRef, endRef, handleScroll } = useChatAutoScroll({
@@ -57,13 +74,70 @@ export default function TutorPanel({ sessionId, profile }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  // 切换主题时拉取推荐问题
-  const selectTopic = useCallback(async (topic: string) => {
-    setCurrentTopic(topic);
-    setShowTopicPicker(false);
-    const questions = await getSuggestedQuestions(topic);
-    setSuggestedQuestions(questions);
-  }, []);
+  useEffect(() => {
+    stopRef.current?.();
+    stopRef.current = null;
+    setIsLoading(false);
+    loadedBackendRef.current = null;
+  }, [sessionId]);
+
+  // 本地无用户消息时，尝试从后端恢复辅导历史
+  useEffect(() => {
+    if (!sessionId || userMessageCount > 0) return;
+    if (loadedBackendRef.current === sessionId) return;
+
+    let cancelled = false;
+    loadedBackendRef.current = sessionId;
+
+    getTutorHistory(sessionId)
+      .then((data) => {
+        if (cancelled || !data.messages?.length) return;
+        onWorkspaceChange((prev) => {
+          if (prev.messages.some((m) => m.role === "user")) return prev;
+          return {
+            ...prev,
+            messages: [
+              createTutorWelcomeMessage(),
+              ...data.messages.map(
+                (m): TutorMessage => ({
+                  role: m.role,
+                  content: m.content,
+                  timestamp: new Date(),
+                  topic: m.topic,
+                })
+              ),
+            ],
+          };
+        });
+      })
+      .catch(() => {
+        loadedBackendRef.current = null;
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, userMessageCount, onWorkspaceChange]);
+
+  const selectTopic = useCallback(
+    async (topic: string) => {
+      onWorkspaceChange((prev) => ({ ...prev, currentTopic: topic }));
+      setShowTopicPicker(false);
+      const questions = await getSuggestedQuestions(topic);
+      setSuggestedQuestions(questions);
+    },
+    [onWorkspaceChange]
+  );
+
+  const setMessages = useCallback(
+    (updater: (prev: TutorMessage[]) => TutorMessage[]) => {
+      onWorkspaceChange((prev) => ({
+        ...prev,
+        messages: updater(prev.messages),
+      }));
+    },
+    [onWorkspaceChange]
+  );
 
   const sendQuestion = useCallback(
     async (question: string) => {
@@ -72,6 +146,7 @@ export default function TutorPanel({ sessionId, profile }: Props) {
 
       setInput("");
       setIsLoading(true);
+      setSaveHint(null);
 
       const userMsg: TutorMessage = {
         role: "user",
@@ -101,11 +176,40 @@ export default function TutorPanel({ sessionId, profile }: Props) {
             return updated;
           });
         },
-        () => setIsLoading(false)
+        () => {
+          setIsLoading(false);
+          stopRef.current = null;
+        }
       );
     },
-    [input, isLoading, sessionId, currentTopic]
+    [isLoading, sessionId, currentTopic, setMessages]
   );
+
+  const handleSave = () => {
+    onWorkspaceChange((prev) => ({ ...prev }));
+    setSaveHint("已保存到当前学习计划");
+    window.setTimeout(() => setSaveHint(null), 2500);
+  };
+
+  const handleExport = () => {
+    if (userMessageCount === 0) {
+      alert("暂无对话内容可导出");
+      return;
+    }
+    downloadTutorTranscript(messages, currentTopic, sessionId);
+  };
+
+  const handleClear = async () => {
+    if (!confirm("确认清空辅导对话？本地与服务器记录都将删除。")) return;
+    try {
+      await clearTutorHistory(sessionId);
+    } catch {
+      // 仍清空本地
+    }
+    onWorkspaceChange(() => createEmptyTutorWorkspace());
+    setSuggestedQuestions([]);
+    setSaveHint(null);
+  };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -116,17 +220,16 @@ export default function TutorPanel({ sessionId, profile }: Props) {
 
   return (
     <div className="h-full flex overflow-hidden">
-      {/* 左侧：主题选择 + 推荐问题 */}
       <aside className="w-64 flex-shrink-0 border-r border-slate-200 bg-white flex flex-col overflow-hidden">
         <div className="p-4 border-b border-slate-100">
           <h2 className="font-bold text-slate-700 text-sm">智能辅导</h2>
           <p className="text-xs text-slate-400 mt-0.5">随时答疑 · 多轮追问</p>
         </div>
 
-        {/* 当前主题 */}
         <div className="p-3 border-b border-slate-100">
           <p className="text-xs font-semibold text-slate-500 mb-2">当前学习主题</p>
           <button
+            type="button"
             onClick={() => setShowTopicPicker(!showTopicPicker)}
             className="w-full flex items-center justify-between px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700 hover:bg-indigo-50 hover:border-indigo-300 transition-all"
           >
@@ -139,6 +242,7 @@ export default function TutorPanel({ sessionId, profile }: Props) {
               {TOPICS.map((t) => (
                 <button
                   key={t}
+                  type="button"
                   onClick={() => selectTopic(t)}
                   className={`w-full text-left px-3 py-2 text-xs transition-colors hover:bg-indigo-50 hover:text-indigo-700 ${
                     currentTopic === t
@@ -153,7 +257,6 @@ export default function TutorPanel({ sessionId, profile }: Props) {
           )}
         </div>
 
-        {/* 推荐问题 */}
         <div className="flex-1 overflow-y-auto p-3">
           {suggestedQuestions.length > 0 && (
             <>
@@ -162,6 +265,7 @@ export default function TutorPanel({ sessionId, profile }: Props) {
                 {suggestedQuestions.map((q, i) => (
                   <button
                     key={i}
+                    type="button"
                     onClick={() => sendQuestion(q)}
                     disabled={isLoading}
                     className="w-full text-left text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-100 rounded-lg px-3 py-2 leading-relaxed transition-all disabled:opacity-50"
@@ -180,7 +284,6 @@ export default function TutorPanel({ sessionId, profile }: Props) {
             </div>
           )}
 
-          {/* 学生画像提示 */}
           {profile.knowledge_level && (
             <div className="mt-4 bg-slate-50 rounded-lg p-3 border border-slate-100">
               <p className="text-xs font-semibold text-slate-500 mb-1">已适配你的画像</p>
@@ -195,11 +298,45 @@ export default function TutorPanel({ sessionId, profile }: Props) {
             </div>
           )}
         </div>
+
+        <div className="p-3 border-t border-slate-100 space-y-2 bg-slate-50/80">
+          <p className="text-[10px] text-slate-400">
+            对话 {userMessageCount} 轮 · 切换标签后自动保留
+          </p>
+          {saveHint && (
+            <p className="text-xs text-green-600 bg-green-50 border border-green-100 rounded-lg px-2 py-1.5">
+              ✅ {saveHint}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={handleSave}
+            className="w-full py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl transition-colors"
+          >
+            💾 保存辅导记录
+          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={handleExport}
+              disabled={userMessageCount === 0}
+              className="flex-1 py-1.5 text-xs border border-slate-200 bg-white hover:bg-slate-50 rounded-lg disabled:opacity-40"
+            >
+              ⬇️ 导出
+            </button>
+            <button
+              type="button"
+              onClick={handleClear}
+              disabled={userMessageCount === 0 && messages.length <= 1}
+              className="flex-1 py-1.5 text-xs border border-slate-200 bg-white hover:bg-rose-50 hover:text-rose-600 rounded-lg disabled:opacity-40"
+            >
+              🗑️ 清空
+            </button>
+          </div>
+        </div>
       </aside>
 
-      {/* 右侧：对话区 */}
       <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
-        {/* 消息列表 */}
         <div
           ref={containerRef}
           onScroll={handleScroll}
@@ -207,7 +344,7 @@ export default function TutorPanel({ sessionId, profile }: Props) {
         >
           {messages.map((msg, i) => (
             <TutorBubble
-              key={i}
+              key={`${msg.role}-${i}-${msg.timestamp instanceof Date ? msg.timestamp.getTime() : i}`}
               message={msg}
               isStreaming={
                 isLoading && i === messages.length - 1 && msg.role === "assistant"
@@ -217,7 +354,6 @@ export default function TutorPanel({ sessionId, profile }: Props) {
           <div ref={endRef} />
         </div>
 
-        {/* 输入区 */}
         <div ref={composerOuterRef} className="flex-shrink-0 border-t border-slate-200 bg-white p-4">
           {currentTopic && (
             <div className="mb-2 flex items-center gap-1.5">
@@ -240,6 +376,7 @@ export default function TutorPanel({ sessionId, profile }: Props) {
               />
             </div>
             <button
+              type="button"
               onClick={() => sendQuestion(input)}
               disabled={isLoading || !input.trim() || !sessionId}
               className="flex-shrink-0 w-10 h-10 bg-violet-600 hover:bg-violet-700 disabled:bg-slate-300 text-white rounded-xl flex items-center justify-center transition-colors"
@@ -292,7 +429,6 @@ function TutorBubble({
     );
   }
 
-  // 拆分正文和自查题
   const [mainContent, selfCheck] = splitSelfCheck(message.content);
 
   return (
@@ -301,25 +437,19 @@ function TutorBubble({
         师
       </div>
       <div className="max-w-[82%] flex flex-col gap-2">
-        {/* 主要回答内容 */}
         <div
           className={`rounded-2xl rounded-tl-sm px-4 py-3 text-sm leading-relaxed bg-white border border-slate-200 shadow-sm text-slate-700 ${
-            isStreaming && !message.content ? "typing-cursor" : isStreaming ? "typing-cursor" : ""
+            isStreaming ? "typing-cursor" : ""
           }`}
         >
           <TutorMarkdown content={mainContent} />
         </div>
-
-        {/* 自查题卡片 */}
-        {selfCheck && !isStreaming && (
-          <SelfCheckCard content={selfCheck} />
-        )}
+        {selfCheck && !isStreaming && <SelfCheckCard content={selfCheck} />}
       </div>
     </div>
   );
 }
 
-/** 分离回答正文和「自查一下」部分 */
 function splitSelfCheck(content: string): [string, string] {
   const markerPatterns = [
     /\n---\n([\s\S]*💡[\s\S]*自查[\s\S]*)/,
@@ -340,7 +470,6 @@ function splitSelfCheck(content: string): [string, string] {
 function SelfCheckCard({ content }: { content: string }) {
   const [revealed, setRevealed] = useState(false);
 
-  // 尝试分离问题和答案
   const lines = content.split("\n").filter((l) => l.trim());
   const questionLines: string[] = [];
   const answerLines: string[] = [];
@@ -374,6 +503,7 @@ function SelfCheckCard({ content }: { content: string }) {
         <div className="mt-2">
           {!revealed ? (
             <button
+              type="button"
               onClick={() => setRevealed(true)}
               className="text-xs text-amber-600 hover:text-amber-800 font-medium border border-amber-300 rounded px-2 py-0.5 transition-colors"
             >
@@ -390,7 +520,6 @@ function SelfCheckCard({ content }: { content: string }) {
   );
 }
 
-/** 辅导专用 Markdown 渲染（支持代码块、加粗、列表、标题） */
 function TutorMarkdown({ content }: { content: string }) {
   if (!content) return null;
 
@@ -422,7 +551,6 @@ function TutorMarkdown({ content }: { content: string }) {
           );
         }
 
-        // 渲染普通文本行
         const lines = part.split("\n");
         return (
           <div key={i}>
@@ -460,8 +588,7 @@ function TutorMarkdown({ content }: { content: string }) {
                     </li>
                   );
               }
-              if (line === "---")
-                return <hr key={j} className="border-slate-200 my-2" />;
+              if (line === "---") return <hr key={j} className="border-slate-200 my-2" />;
               if (line === "") return <br key={j} />;
               return (
                 <p key={j} className="my-0.5 leading-relaxed">
@@ -476,7 +603,6 @@ function TutorMarkdown({ content }: { content: string }) {
   );
 }
 
-/** 行内 Markdown：加粗、行内代码 */
 function renderInline(text: string): React.ReactNode {
   const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
   return (

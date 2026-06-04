@@ -1,15 +1,21 @@
 export type {
   KnowledgeLevel,
+  LearningPreference,
   CognitiveStyle,
   LearningGoal,
   LearningPace,
+  ProgrammingExperience,
   StudentProfile,
   ProfileDimensionKey,
+  ProfileExtraKey,
 } from "./profile";
 export {
   PROFILE_DIMENSION_LABELS,
+  masteryToGradient,
+  masteryToLabel,
   createEmptyProfile,
   isProfileDimensionFilled,
+  countFilledDimensions,
 } from "./profile";
 
 export type {
@@ -53,16 +59,17 @@ export type {
   StreamCancelFn,
   ChatStreamCallbacks,
   TutorStreamCallbacks,
+  AdjustPathRequest,
+  PathAdjustStreamEventName,
 } from "./chat";
 export { parseSseJson } from "./chat";
 
-/** 辅导面板消息 */
-export interface TutorMessage {
-  role: "user" | "assistant";
-  content: string;
-  timestamp: Date;
-  topic?: string;
-}
+export type { TutorMessage, TutorWorkspace, TutorHistoryResponse } from "./tutor";
+export {
+  TUTOR_WELCOME_CONTENT,
+  createTutorWelcomeMessage,
+  createEmptyTutorWorkspace,
+} from "./tutor";
 
 /** 本地持久化的学习计划会话 */
 export interface PlannerSession {
@@ -77,6 +84,7 @@ export interface PlannerSession {
   messages: import("./chat").ChatMessage[];
   learningPath: string;
   resourceWorkspace: import("./resource").ResourceWorkspace;
+  tutorWorkspace: import("./tutor").TutorWorkspace;
 }
 
 /** 知识库 API 类型 */
@@ -142,4 +150,55 @@ export interface WebSearchResponse {
 
 export interface InitKnowledgeResponse {
   message: string;
+}
+
+/** 学习进度管理 */
+export interface ChapterProgress {
+  course: string;
+  chapter_id: string;
+  completed_at: string;
+}
+
+export interface QuizScore {
+  quiz_topic: string;
+  score: number;
+  total: number;
+  percentage: number;
+  created_at: string;
+}
+
+export interface ComprehensionScore {
+  topic: string;
+  score: number;
+  feedback: string;
+  created_at: string;
+}
+
+export interface WeakPoint {
+  weak_point: string;
+  status: string;
+}
+
+export interface ProgressSummary {
+  session_id: string;
+  completed_chapters: ChapterProgress[];
+  chapter_count: number;
+  quiz_scores: QuizScore[];
+  quiz_average: number;
+  comprehension_scores: ComprehensionScore[];
+  comprehension_average: number;
+  weak_points: WeakPoint[];
+}
+
+export interface MarkChapterRequest {
+  session_id: string;
+  course: string;
+  chapter_id: string;
+}
+
+export interface RecordQuizScoreRequest {
+  session_id: string;
+  quiz_topic: string;
+  score: number;
+  total: number;
 }

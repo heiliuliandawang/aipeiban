@@ -1,15 +1,56 @@
 """
-联网检索：优先 ddgs 多引擎回退，失败时用 Wikipedia Open API（均无需 Key）。
-旧版 duckduckgo-search 默认走 Bing，国内常报 ConnectError / return None。
+联网检索（学习检索 Tab）
+
+策略（WEB_SEARCH_STRATEGY，默认 fast）：
+  fast     — 先 Wikipedia（中英文并行，通常 1–3s），够条数直接返回；
+             否则最多 2 个 ddgs 引擎并行，单引擎超时 WEB_SEARCH_TIMEOUT（默认 10s）
+  thorough — 旧逻辑：ddgs 多引擎顺序尝试，再 Wikipedia
+
+失败时可选用星火推荐阅读（WEB_SEARCH_LLM_FALLBACK=1）。
 """
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
 import httpx
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_BACKENDS = ("mojeek", "brave", "duckduckgo", "yahoo")
+_DEFAULT_BACKENDS = ("mojeek", "brave")
+_CACHE_TTL_SEC = 300
+_result_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _timeout_sec() -> float:
+    return float(os.getenv("WEB_SEARCH_TIMEOUT", "10"))
+
+
+def _cache_key(query: str, max_results: int) -> str:
+    return f"{query.strip().lower()}|{max_results}"
+
+
+def _cache_get(query: str, max_results: int) -> list[dict[str, Any]] | None:
+    key = _cache_key(query, max_results)
+    entry = _result_cache.get(key)
+    if not entry:
+        return None
+    ts, data = entry
+    if time.monotonic() - ts > _CACHE_TTL_SEC:
+        _result_cache.pop(key, None)
+        return None
+    logger.info("联网检索命中缓存 query=%s", query[:60])
+    return list(data)
+
+
+def _cache_set(query: str, max_results: int, data: list[dict[str, Any]]) -> None:
+    if not data:
+        return
+    _result_cache[_cache_key(query, max_results)] = (time.monotonic(), list(data))
 
 
 def _normalize_item(raw: dict[str, Any]) -> dict[str, str] | None:
@@ -21,23 +62,93 @@ def _normalize_item(raw: dict[str, Any]) -> dict[str, str] | None:
     return {"title": title, "url": url, "snippet": snippet}
 
 
-def _search_ddgs(query: str, max_results: int) -> list[dict[str, Any]]:
+def _merge_results(*groups: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for group in groups:
+        for item in group:
+            key = (item.get("url") or "").strip() or (item.get("title") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _search_ddgs_one(query: str, max_results: int, backend: str) -> list[dict[str, Any]]:
+    from ddgs import DDGS
+    from ddgs.exceptions import DDGSException
+
+    collected: list[dict[str, Any]] = []
+    timeout = int(_timeout_sec())
+    with DDGS(timeout=timeout) as ddgs:
+        for item in ddgs.text(query, max_results=max_results, backend=backend):
+            if not item:
+                continue
+            norm = _normalize_item(item)
+            if norm:
+                collected.append(norm)
+    if collected:
+        logger.info("ddgs 成功 backend=%s count=%s", backend, len(collected))
+    return collected[:max_results]
+
+
+def _search_ddgs_parallel(query: str, max_results: int) -> list[dict[str, Any]]:
+    try:
+        from ddgs.exceptions import DDGSException  # noqa: F401 — 确认已安装
+    except ImportError as e:
+        raise ImportError("未安装 ddgs，请在 backend 目录执行: pip install ddgs") from e
+
+    backends_raw = os.getenv("WEB_SEARCH_BACKENDS", ",".join(_DEFAULT_BACKENDS))
+    backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
+    max_parallel = max(1, min(int(os.getenv("WEB_SEARCH_PARALLEL", "2")), len(backends)))
+    backends = backends[:max_parallel]
+
+    timeout = _timeout_sec()
+    last_err: Exception | None = None
+
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        futures = {
+            pool.submit(_search_ddgs_one, query, max_results, backend): backend
+            for backend in backends
+        }
+        try:
+            for future in as_completed(futures, timeout=timeout + 3):
+                backend = futures[future]
+                try:
+                    hits = future.result()
+                    if hits:
+                        return hits
+                except Exception as e:
+                    last_err = e
+                    logger.warning("ddgs backend=%s 失败: %s", backend, str(e)[:200])
+        except TimeoutError:
+            logger.warning("ddgs 并行检索总超时 %.0fs", timeout + 3)
+
+    if last_err:
+        raise last_err
+    return []
+
+
+def _search_ddgs_sequential(query: str, max_results: int) -> list[dict[str, Any]]:
+    """thorough 模式：顺序尝试全部引擎。"""
     try:
         from ddgs import DDGS
         from ddgs.exceptions import DDGSException
     except ImportError as e:
-        raise ImportError(
-            "未安装 ddgs，请在 backend 目录执行: pip install ddgs"
-        ) from e
+        raise ImportError("未安装 ddgs，请在 backend 目录执行: pip install ddgs") from e
 
-    backends_raw = os.getenv("WEB_SEARCH_BACKENDS", ",".join(_DEFAULT_BACKENDS))
+    backends_raw = os.getenv("WEB_SEARCH_BACKENDS", "mojeek,brave,duckduckgo,yahoo")
     backends = [b.strip() for b in backends_raw.split(",") if b.strip()]
-
+    timeout = int(_timeout_sec())
     last_err: Exception | None = None
+
     for backend in backends:
         try:
             collected: list[dict[str, Any]] = []
-            with DDGS(timeout=int(os.getenv("WEB_SEARCH_TIMEOUT", "25"))) as ddgs:
+            with DDGS(timeout=timeout) as ddgs:
                 for item in ddgs.text(query, max_results=max_results, backend=backend):
                     if not item:
                         continue
@@ -45,12 +156,7 @@ def _search_ddgs(query: str, max_results: int) -> list[dict[str, Any]]:
                     if norm:
                         collected.append(norm)
             if collected:
-                logger.info(
-                    "联网检索成功 backend=%s query=%s count=%s",
-                    backend,
-                    query[:80],
-                    len(collected),
-                )
+                logger.info("ddgs 成功 backend=%s count=%s", backend, len(collected))
                 return collected[:max_results]
         except DDGSException as e:
             last_err = e
@@ -64,11 +170,58 @@ def _search_ddgs(query: str, max_results: int) -> list[dict[str, Any]]:
     return []
 
 
-def _search_wikipedia(query: str, max_results: int) -> list[dict[str, Any]]:
-    """Wikipedia OpenSearch，教育类关键词较稳。"""
-    results: list[dict[str, Any]] = []
-    timeout = float(os.getenv("WEB_SEARCH_TIMEOUT", "25"))
+async def _fetch_wikipedia_lang(
+    client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> list[dict[str, Any]]:
+    api = f"https://{lang}.wikipedia.org/w/api.php"
+    params = {
+        "action": "opensearch",
+        "search": query,
+        "limit": max_results,
+        "namespace": 0,
+        "format": "json",
+    }
+    resp = await client.get(api, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list) or len(data) < 4:
+        return []
 
+    titles, descriptions, urls = data[1], data[2], data[3]
+    results: list[dict[str, Any]] = []
+    for title, desc, url in zip(titles, descriptions, urls):
+        results.append(
+            {
+                "title": title or "Wikipedia",
+                "url": url or "",
+                "snippet": desc or f"维基百科词条：{title}",
+            }
+        )
+    return results
+
+
+async def _search_wikipedia_async(query: str, max_results: int) -> list[dict[str, Any]]:
+    """中英文 Wikipedia 并行请求。"""
+    timeout = _timeout_sec()
+    results: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            parts = await asyncio.gather(
+                _fetch_wikipedia_lang(client, query, max_results, "zh"),
+                _fetch_wikipedia_lang(client, query, max_results, "en"),
+                return_exceptions=True,
+            )
+        for part in parts:
+            if isinstance(part, list):
+                results = _merge_results(results, part, limit=max_results)
+    except Exception as e:
+        logger.warning("Wikipedia 异步检索失败: %s", e)
+    return results[:max_results]
+
+
+def _search_wikipedia_sync(query: str, max_results: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    timeout = _timeout_sec()
     for lang in ("zh", "en"):
         if len(results) >= max_results:
             break
@@ -100,20 +253,41 @@ def _search_wikipedia(query: str, max_results: int) -> list[dict[str, Any]]:
                 )
         except Exception as e:
             logger.warning("Wikipedia %s 检索失败: %s", lang, e)
-
     return results
 
 
-def search_web(query: str, max_results: int = 8) -> list[dict[str, Any]]:
-    q = query.strip()
-    if not q:
-        return []
+async def _search_web_fast(query: str, max_results: int) -> list[dict[str, Any]]:
+    """fast：维基优先，不足再并行 ddgs。"""
+    wiki_min = max(1, int(os.getenv("WEB_SEARCH_WIKI_MIN", "2")))
 
-    max_results = min(max(max_results, 1), 12)
+    wiki = await _search_wikipedia_async(query, max_results)
+    if len(wiki) >= wiki_min:
+        logger.info("联网检索 fast/Wikipedia 直接返回 count=%s", len(wiki))
+        return wiki
 
-    # 1) ddgs 多引擎
+    ddgs: list[dict[str, Any]] = []
     try:
-        hits = _search_ddgs(q, max_results)
+        ddgs = await asyncio.wait_for(
+            asyncio.to_thread(_search_ddgs_parallel, query, max_results),
+            timeout=_timeout_sec() + 4,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("联网检索 ddgs 等待超时")
+    except ImportError:
+        raise
+    except Exception as e:
+        logger.warning("联网检索 ddgs 失败: %s", str(e)[:200])
+
+    merged = _merge_results(wiki, ddgs, limit=max_results)
+    if merged:
+        return merged
+    return wiki
+
+
+def search_web_thorough(query: str, max_results: int) -> list[dict[str, Any]]:
+    """thorough：ddgs 顺序多引擎，再 Wikipedia。"""
+    try:
+        hits = _search_ddgs_sequential(query, max_results)
         if hits:
             return hits
     except ImportError:
@@ -121,15 +295,30 @@ def search_web(query: str, max_results: int = 8) -> list[dict[str, Any]]:
     except Exception as e:
         logger.warning("ddgs 全部引擎失败，尝试 Wikipedia: %s", str(e)[:300])
 
-    # 2) Wikipedia 兜底
-    wiki = _search_wikipedia(q, max_results)
+    wiki = _search_wikipedia_sync(query, max_results)
     if wiki:
-        logger.info("联网检索 Wikipedia 兜底成功 query=%s count=%s", q[:80], len(wiki))
         return wiki
 
     raise RuntimeError(
-        "联网检索暂时不可用（外网搜索服务受限）。请稍后重试，或改用「本地课程」/「资源生成」。"
+        "联网检索暂时不可用（外网搜索服务受限）。请稍后重试，或改用「本地课程」。"
     )
+
+
+def search_web(query: str, max_results: int = 8) -> list[dict[str, Any]]:
+    """同步入口（供 thorough 或 to_thread 使用）。"""
+    strategy = os.getenv("WEB_SEARCH_STRATEGY", "fast").strip().lower()
+    if strategy == "thorough":
+        return search_web_thorough(query, max_results)
+
+    wiki = _search_wikipedia_sync(query, max_results)
+    if len(wiki) >= int(os.getenv("WEB_SEARCH_WIKI_MIN", "2")):
+        return wiki
+    try:
+        ddgs = _search_ddgs_parallel(query, max_results)
+        merged = _merge_results(wiki, ddgs, limit=max_results)
+        return merged or wiki
+    except Exception:
+        return wiki
 
 
 async def _search_llm_reading_list(query: str, max_results: int) -> list[dict[str, Any]]:
@@ -180,13 +369,40 @@ async def _search_llm_reading_list(query: str, max_results: int) -> list[dict[st
 
 
 async def search_web_async(query: str, max_results: int = 8) -> list[dict[str, Any]]:
-    """异步联网检索：先公网多引擎 + Wikipedia，失败则用星火推荐。"""
-    import asyncio
+    """异步联网检索。"""
+    q = query.strip()
+    if not q:
+        return []
+
+    max_results = min(max(max_results, 1), 12)
+
+    cached = _cache_get(q, max_results)
+    if cached is not None:
+        return cached
+
+    strategy = os.getenv("WEB_SEARCH_STRATEGY", "fast").strip().lower()
 
     try:
-        return await asyncio.to_thread(search_web, query, max_results)
+        if strategy == "thorough":
+            results = await asyncio.to_thread(search_web_thorough, q, max_results)
+        else:
+            results = await _search_web_fast(q, max_results)
+    except ImportError:
+        raise
     except Exception as e:
-        logger.warning("公网检索失败，启用星火推荐阅读: %s", str(e)[:200])
-        if os.getenv("WEB_SEARCH_LLM_FALLBACK", "1").strip().lower() in ("0", "false", "no"):
-            raise
-        return await _search_llm_reading_list(query, max_results)
+        logger.warning("公网检索失败，尝试兜底: %s", str(e)[:200])
+        results = []
+
+    if results:
+        _cache_set(q, max_results, results)
+        return results
+
+    if os.getenv("WEB_SEARCH_LLM_FALLBACK", "1").strip().lower() in ("0", "false", "no"):
+        raise RuntimeError(
+            "联网检索暂时不可用。请改用「本地课程」，或检查网络后重试。"
+        )
+
+    logger.warning("公网检索无结果，启用星火推荐阅读（较慢）")
+    llm_results = await _search_llm_reading_list(q, max_results)
+    _cache_set(q, max_results, llm_results)
+    return llm_results

@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "patterns": {
+    "political": [
+      "政治敏感",
+      "某某党",
+      "某某领导"
+    ],
+    "violence": [
+      "暴力",
+      "恐怖",
+      "血腥"
+    ],
+    "adult": [
+      "色情",
+      "黄色"
+    ],
+    "discrimination": [
+      "歧视",
+      "种族"
+    ]
+  },
+  "description": "Add regex patterns for each category"
+}

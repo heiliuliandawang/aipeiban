@@ -111,3 +111,17 @@ export interface TutorStreamCallbacks {
 export function parseSseJson<T>(data: string): T {
   return JSON.parse(data) as T;
 }
+
+// ── 路径调整 ──────────────────────────────────────────────────────────────────
+
+/** POST /chat/path/adjust 请求体 */
+export interface AdjustPathRequest {
+  session_id: string;
+  /** 学生反馈，如"题库太难了"、"进度太快" */
+  feedback_text: string;
+  /** 当前路径正文（Markdown）；为空时后端直接生成新路径 */
+  current_path?: string;
+}
+
+/** fetch SSE `/chat/path/adjust` 事件名 */
+export type PathAdjustStreamEventName = "delta" | "done" | "server_error";

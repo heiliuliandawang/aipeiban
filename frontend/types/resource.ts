@@ -43,12 +43,15 @@ export interface ResourceWorkspace {
   taskStatuses: Partial<Record<ResourceType, ResourceTaskStatus>>;
   resources: GeneratedResource[];
   activeResourceType?: ResourceType;
+  /** 最近一次生成失败时的提示 */
+  lastError?: string;
 }
 
 export interface GenerateResourcesRequest {
   session_id: string;
   topic: string;
   resource_types: ResourceType[];
+  profile?: StudentProfile;
 }
 
 export interface ResourceProgressEvent {
